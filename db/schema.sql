@@ -24,7 +24,7 @@ create table rules (
 insert into rules (key, value, description) values
   ('hold_duration_hours',             '48',      'How long a supplier slot stays soft-held awaiting client confirmation'),
   ('client_response_reminder_hours',  '24',      'Send reminder if client has not responded'),
-  ('client_escalate_hours',           '72',      'Escalate to coordinator if client still has not responded'),
+  ('client_escalate_hours',           '36',      'Escalate to coordinator if client still has not responded (must be < hold_duration_hours to leave a rescue window)'),
   ('brief_lead_days',                 '3',       'Brief must be APPROVED this many days before the shoot'),
   ('brief_escalate_grace_hours',      '24',      'Grace after brief deadline before it becomes the coordinator''s problem'),
   ('deliverable_sla_days',            '5',       'Business days for supplier to deliver after the shoot'),
@@ -34,9 +34,12 @@ insert into rules (key, value, description) values
   ('slot_options_per_client',         '3',       'How many date options to offer a client'),
   ('shoot_duration_minutes',          '240',     'A shoot slot is 4 hours'),
   ('stale_request_days',              '2',       'A request stuck with one owner this long shows as an exception'),
+  ('missing_info_escalate_days',      '4',       'A MISSING_INFO request unresolved this long becomes the coordinator''s problem'),
   ('eligibility_review_hours',        '24',      'Time for the coordinator to decide an eligibility exception'),
   ('matching_sla_hours',              '24',      'System should propose a match within this; past it the request shows as an exception'),
+  ('matching_escalate_hours',         '48',      'Unmatched past this becomes the coordinator''s problem'),
   ('match_approval_hours',            '24',      'Coordinator should approve or reject a proposed match within this'),
+  ('match_approval_escalate_hours',   '48',      'An unreviewed proposal past this is escalated'),
   ('shoot_day_end_hour',              '20',      'Local hour by which a shoot day is considered over'),
   ('supplier_availability_weeks',     '3',       'How many weeks ahead the availability link collects'),
   ('timezone',                        '"Asia/Jerusalem"', 'Timezone used to interpret hour-of-day rules'),
@@ -391,6 +394,15 @@ create trigger entitlement_events_append_only
   before update or delete on entitlement_events
   for each row execute function forbid_mutation();
 
+-- Row-level triggers do not fire on TRUNCATE — block it explicitly.
+create trigger events_no_truncate
+  before truncate on events
+  for each statement execute function forbid_mutation();
+
+create trigger entitlement_events_no_truncate
+  before truncate on entitlement_events
+  for each statement execute function forbid_mutation();
+
 -- ─────────────────────────────────────────────────────────────
 -- Signed single-purpose links. Store the hash, never the token. (invariant 9)
 -- ─────────────────────────────────────────────────────────────
@@ -407,7 +419,7 @@ create table access_tokens (
   revoked_at   timestamptz,
   created_at   timestamptz not null default now()
 );
-create index on access_tokens (token_hash);
+-- token_hash lookups are covered by the unique constraint's index.
 
 -- ─────────────────────────────────────────────────────────────
 -- Outbound notifications (channel-agnostic; WhatsApp is just another adapter)
@@ -437,6 +449,7 @@ select
   null::text                             as incident_kind,
   c.id                                   as client_id,
   c.name                                 as client_name,
+  null::text                             as supplier_name,
   r.shoot_type::text                     as shoot_type,
   r.status::text                         as status,
   r.current_owner_type,
@@ -461,7 +474,8 @@ select
   i.id,
   i.kind,
   c2.id,
-  coalesce(s.name, c2.name, i.kind),
+  c2.name,
+  s.name,
   r2.shoot_type::text,
   'INCIDENT',
   'COORDINATOR'::owner_type,
@@ -496,32 +510,51 @@ alter table shoot_slots            enable row level security;
 alter table supplier_availability  enable row level security;
 alter table deliverables           enable row level security;
 
+-- nullif(...,'') keeps the uuid cast deterministic on pooled connections
+-- where an unset GUC reads back as '' rather than NULL.
+create function app_supplier_id() returns uuid
+  language sql stable
+  as $$ select nullif(current_setting('app.supplier_id', true), '')::uuid $$;
+
 create policy supplier_sees_self on suppliers
-  for select using (id = current_setting('app.supplier_id', true)::uuid);
+  for select using (id = app_supplier_id());
 
 create policy supplier_sees_own_days on supplier_days
-  for select using (supplier_id = current_setting('app.supplier_id', true)::uuid);
+  for select using (supplier_id = app_supplier_id());
 
 create policy supplier_sees_own_slots on shoot_slots
   for select using (
     supplier_day_id in (
       select id from supplier_days
-      where supplier_id = current_setting('app.supplier_id', true)::uuid
+      where supplier_id = app_supplier_id()
     )
   );
 
-create policy supplier_manages_own_availability on supplier_availability
-  for all
-  using      (supplier_id = current_setting('app.supplier_id', true)::uuid)
-  with check (supplier_id = current_setting('app.supplier_id', true)::uuid);
+create policy supplier_reads_own_availability on supplier_availability
+  for select using (supplier_id = app_supplier_id());
+
+create policy supplier_adds_own_availability on supplier_availability
+  for insert with check (supplier_id = app_supplier_id());
+
+-- A supplier may edit/remove only windows the workflow is not using:
+-- SOFT_HELD and CONFIRMED rows belong to the booking flow. Without the status
+-- guard a supplier connection could sabotage a live hold. (invariant 4)
+create policy supplier_updates_own_free_availability on supplier_availability
+  for update
+  using      (supplier_id = app_supplier_id() and status in ('AVAILABLE','BLOCKED','RELEASED'))
+  with check (supplier_id = app_supplier_id() and status in ('AVAILABLE','BLOCKED','RELEASED'));
+
+create policy supplier_deletes_own_free_availability on supplier_availability
+  for delete
+  using (supplier_id = app_supplier_id() and status in ('AVAILABLE','BLOCKED','RELEASED'));
 
 create policy supplier_sees_own_deliverables on deliverables
-  for select using (supplier_id = current_setting('app.supplier_id', true)::uuid);
+  for select using (supplier_id = app_supplier_id());
 
 create policy supplier_updates_own_deliverables on deliverables
   for update
-  using      (supplier_id = current_setting('app.supplier_id', true)::uuid)
-  with check (supplier_id = current_setting('app.supplier_id', true)::uuid);
+  using      (supplier_id = app_supplier_id())
+  with check (supplier_id = app_supplier_id());
 
 grant usage on schema public to supplier_portal;
 grant select on suppliers, supplier_days, shoot_slots to supplier_portal;

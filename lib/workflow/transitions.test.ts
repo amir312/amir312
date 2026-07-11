@@ -26,6 +26,9 @@ const rules = new Rules({
   hold_duration_hours: 48,
   client_response_reminder_hours: 24,
   client_escalate_hours: 72,
+  missing_info_escalate_days: 4,
+  matching_escalate_hours: 48,
+  match_approval_escalate_hours: 48,
   brief_lead_days: 3,
   brief_escalate_grace_hours: 24,
   deliverable_sla_days: 5,
@@ -106,7 +109,7 @@ function ev<K extends WorkflowEventKind>(
 const confirmExtra = {
   shootDate: SHOOT_DATE,
   confirmedBy: "CLIENT" as const,
-  briefOwnerId: IDS.sm,
+  briefOwner: { type: "SOCIAL_MANAGER" as const, id: IDS.sm },
   supplierId: IDS.supplier,
 };
 
@@ -313,7 +316,7 @@ const cases: Case[] = [
   {
     name: "BRIEF_STARTED → BRIEF_PENDING with the brief deadline",
     from: "CONFIRMED",
-    event: ev("BRIEF_STARTED", { shootDate: SHOOT_DATE, briefOwnerId: IDS.sm }),
+    event: ev("BRIEF_STARTED", { shootDate: SHOOT_DATE, briefOwner: { type: "SOCIAL_MANAGER", id: IDS.sm } }),
     expected: {
       status: "BRIEF_PENDING",
       ownerType: "SOCIAL_MANAGER",
@@ -326,8 +329,19 @@ const cases: Case[] = [
   {
     name: "BRIEF_STARTED is idempotent from BRIEF_PENDING (re-opened draft)",
     from: "BRIEF_PENDING",
-    event: ev("BRIEF_STARTED", { shootDate: SHOOT_DATE, briefOwnerId: IDS.sm }),
+    event: ev("BRIEF_STARTED", { shootDate: SHOOT_DATE, briefOwner: { type: "SOCIAL_MANAGER", id: IDS.sm } }),
     expected: { status: "BRIEF_PENDING", action: "WRITE_BRIEF" },
+  },
+  {
+    name: "BRIEF_STARTED for an unmanaged client puts the COORDINATOR on the spine",
+    from: "CONFIRMED",
+    event: ev("BRIEF_STARTED", { shootDate: SHOOT_DATE, briefOwner: { type: "COORDINATOR", id: IDS.sm } }),
+    expected: {
+      status: "BRIEF_PENDING",
+      ownerType: "COORDINATOR",
+      ownerId: IDS.sm,
+      action: "WRITE_BRIEF",
+    },
   },
   {
     name: "BRIEF_SENT_TO_CLIENT → client owns APPROVE_BRIEF with response windows",
@@ -345,7 +359,11 @@ const cases: Case[] = [
   {
     name: "BRIEF_CHANGES_REQUESTED → back to the writer; the brief deadline does NOT move",
     from: "BRIEF_PENDING",
-    event: ev("BRIEF_CHANGES_REQUESTED", { shootDate: SHOOT_DATE, briefOwnerId: IDS.sm, feedback: "פחות תקריבים" }),
+    event: ev("BRIEF_CHANGES_REQUESTED", {
+      shootDate: SHOOT_DATE,
+      briefOwner: { type: "SOCIAL_MANAGER", id: IDS.sm },
+      feedback: "פחות תקריבים",
+    }),
     expected: {
       status: "BRIEF_PENDING",
       ownerType: "SOCIAL_MANAGER",
@@ -397,6 +415,7 @@ const cases: Case[] = [
   {
     name: "T1_CONFIRMED works from CONFIRMED too (no-brief path)",
     from: "CONFIRMED",
+    request: { needsBrief: false },
     event: ev("T1_CONFIRMED", { supplierId: IDS.supplier, shootDate: SHOOT_DATE }),
     expected: { status: "READY", action: "RUN_SHOOT" },
   },
@@ -652,14 +671,16 @@ describe("paired-confirmation rule", () => {
   });
 
   it("branch 3 — both decline / hold expires with zero confirmations → whole day releases, both return to PENDING_MATCH", () => {
-    // Sequential declines: B first (partner still pending)...
+    // Sequential declines: B first (partner still pending) — the half frees
+    // QUIETLY: nothing is confirmed, so no incident is raised (it would go
+    // stale the moment the day fully collapses).
     const first = transition(
       req("SOFT_HELD"),
       ev("CLIENT_DECLINED", { pairing: pairing({ partnerStatus: "PENDING" }) }),
       rules,
     );
     expect(first.status).toBe("PENDING_MATCH");
-    expect(first.effects).toContainEqual({ type: "RELEASE_HALF_DAY", dayId: IDS.day });
+    expect(first.effects).toEqual([{ type: "RELEASE_HALF_DAY", dayId: IDS.day }]);
 
     // ...then A declines too (partner already released) → the WHOLE day releases.
     const second = transition(
@@ -672,6 +693,7 @@ describe("paired-confirmation rule", () => {
     expect(second.action).toBe("FIND_SUPPLIER");
     expect(second.effects).toContainEqual({ type: "RELEASE_DAY", dayId: IDS.day });
     expect(second.effects).toContainEqual({ type: "SET_DAY_STATUS", dayId: IDS.day, status: "CANCELLED" });
+    expect(second.effects.filter((e) => e.type === "RAISE_INCIDENT")).toEqual([]);
   });
 
   it("branch 4 — supplier does not accept a solo half day and only one client confirmed → incident with two options, the system does NOT decide", () => {
@@ -715,11 +737,15 @@ describe("paired-confirmation rule", () => {
     );
   });
 
-  it("confirming into a half-empty day when the supplier accepts solo raises no incident", () => {
+  it("confirming into a half-empty day (supplier accepts solo) rematches the free half and tells Noam", () => {
+    // Same outcome as "partner falls after I confirmed" — order must not matter.
     const a = transition(req("SOFT_HELD"), confirm({ partnerStatus: "RELEASED" }), rules);
     expect(a.status).toBe("CONFIRMED");
-    expect(a.effects.filter((e) => e.type === "RAISE_INCIDENT")).toEqual([]);
     expect(a.effects).toContainEqual({ type: "SET_DAY_STATUS", dayId: IDS.day, status: "PARTIALLY_CONFIRMED" });
+    expect(a.effects).toContainEqual({ type: "REMATCH_HALF", dayId: IDS.day, date: SHOOT_DATE, region: "SHARON" });
+    expect(a.effects).toContainEqual(
+      expect.objectContaining({ type: "RAISE_INCIDENT", kind: "HALF_DAY_FREE" }),
+    );
   });
 
   it("a solo (unpaired) confirmation confirms the day directly", () => {
@@ -774,21 +800,67 @@ describe("hold expiry", () => {
     expect(r.effects).toContainEqual({ type: "RELEASE_DAY", dayId: IDS.day });
   });
 
-  it("hold expires while the partner is still deciding → only this half frees, day keeps waiting", () => {
+  it("hold expires while the partner is still deciding → only this half frees, quietly; day keeps waiting", () => {
     const r = transition(
       req("SOFT_HELD"),
       ev("HOLD_EXPIRED", { pairing: pairing({ partnerStatus: "PENDING" }) }),
       rules,
     );
-    expect(r.effects).toContainEqual({ type: "RELEASE_HALF_DAY", dayId: IDS.day });
-    expect(r.effects).not.toContainEqual(expect.objectContaining({ type: "SET_DAY_STATUS" }));
-    expect(r.effects).toContainEqual(
-      expect.objectContaining({ type: "RAISE_INCIDENT", kind: "HALF_DAY_FREE" }),
-    );
+    expect(r.effects).toEqual([{ type: "RELEASE_HALF_DAY", dayId: IDS.day }]);
   });
 });
 
 describe("guards", () => {
+  it("MATCH_PROPOSED is rejected while eligibility is unresolved — the machine is the gate, not the matcher", () => {
+    for (const eligibility of ["NEEDS_CHECK", "NOT_ELIGIBLE"] as const) {
+      expect(() =>
+        transition(
+          req("PENDING_MATCH", { eligibility }),
+          ev("MATCH_PROPOSED", { paired: true, proposalCount: 2 }),
+          rules,
+        ),
+      ).toThrowError(/eligibility/);
+    }
+    // A granted exception matches fine.
+    const ok = transition(
+      req("PENDING_MATCH", { eligibility: "EXCEPTION_GRANTED" }),
+      ev("MATCH_PROPOSED", { paired: true, proposalCount: 2 }),
+      rules,
+    );
+    expect(ok.status).toBe("OPTIONS_PROPOSED");
+  });
+
+  it("T1_CONFIRMED cannot skip a required brief from CONFIRMED", () => {
+    expect(() =>
+      transition(
+        req("CONFIRMED", { needsBrief: true }),
+        ev("T1_CONFIRMED", { supplierId: IDS.supplier, shootDate: SHOOT_DATE }),
+        rules,
+      ),
+    ).toThrowError(/needs_brief/);
+  });
+
+  it("CLIENT_CANCELLED with a confirmed partner and a full-day-only supplier folds the two options into the cancel incident", () => {
+    const r = transition(
+      req("BRIEF_PENDING"),
+      ev("CLIENT_CANCELLED", {
+        pairing: pairing({ partnerStatus: "CONFIRMED", supplierAcceptsSoloHalfDay: false }),
+      }),
+      rules,
+    );
+    const incidents = r.effects.filter((e) => e.type === "RAISE_INCIDENT");
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]).toMatchObject({
+      kind: "CLIENT_CANCEL",
+      proposedResolution: {
+        options: [
+          expect.objectContaining({ action: "REPLACE_CLIENT" }),
+          expect.objectContaining({ action: "APPROVE_SOLO_SURCHARGE" }),
+        ],
+      },
+    });
+  });
+
   it("rejects an event that is invalid for the current status", () => {
     expect(() =>
       transition(req("DRAFT"), ev("T1_CONFIRMED", { supplierId: IDS.supplier, shootDate: SHOOT_DATE }), rules),

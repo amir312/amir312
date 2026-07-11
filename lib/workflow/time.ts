@@ -63,6 +63,9 @@ export function dayOfWeekInTz(date: Date, tz: string): number {
  * as observed in `tz`. Keeps the time-of-day of `from`.
  */
 export function addBusinessDays(from: Date, n: number, weekendDays: number[], tz: string): Date {
+  if (new Set(weekendDays).size >= 7) {
+    throw new Error("weekend_days covers the whole week — no business day can ever be reached");
+  }
   let d = from;
   let added = 0;
   while (added < n) {

@@ -27,7 +27,7 @@ spec did not dictate.
 - `lib/i18n/he.ts` — full Hebrew vocabulary: statuses, owners, actions, per-event timeline
   summaries, incident summaries.
 - `docs/whatsapp-templates.md` — 12 Hebrew UTILITY templates ready for Meta submission.
-- Tests: 73 (4 files) against real PostgreSQL 16 (template-clone harness).
+- Tests: 84 (4 files, after review fixes) against real PostgreSQL 16 (template-clone harness).
 
 **Acceptance criteria (executed, not assumed):**
 
@@ -39,8 +39,8 @@ spec did not dictate.
 | Hold expiry with exactly one of two confirmed | **PASS** — named test; confirmer untouched, half freed, HALF_DAY_FREE incident |
 | `accepts_solo_half_day = false` + one confirmation → incident, no decision | **PASS** — SOLO_DAY_DECISION incident with two prepared options; day not cancelled, not confirmed, partner untouched |
 | Open request with null owner → the DATABASE rejects it | **PASS** — proven on INSERT and on UPDATE against real Postgres (`no_orphan_requests`) |
-| `pnpm test` green | **PASS** — 73/73 |
-| 100% line coverage on `transitions.ts` | **PASS** — enforced as a vitest coverage threshold (build fails below 100%) |
+| `pnpm test` green | **PASS** — 84/84 after review fixes |
+| 100% line coverage on `transitions.ts` | **PASS** — enforced threshold (probe: 101% fails the run); coverage-summary.json shows 100% lines AND 100% branches |
 | `pnpm typecheck` / `pnpm lint` / `pnpm build` | **PASS** / **PASS** / **PASS** |
 
 **Decisions the spec did not dictate (recorded on purpose):**
@@ -73,4 +73,24 @@ spec did not dictate.
 11. Supplier-cancel returns the affected request(s) to PENDING_MATCH (client did nothing
     wrong); client-cancel terminates the request and raises an incident.
 
-**Reviewer findings and fixes:** _pending — appended below after the fresh-context review._
+**Reviewer findings and fixes** (fresh-context subagent review; all verified by re-running
+typecheck/lint/tests/build and live DB probes):
+
+| # | severity | finding | resolution |
+| --- | --- | --- | --- |
+| F1 | MAJOR | `briefSpine` hardcoded owner type `SOCIAL_MANAGER`; coordinator-owned briefs (unmanaged clients) would be misattributed on the spine | events now carry `briefOwner: {type: SOCIAL_MANAGER\|COORDINATOR, id}`; test added |
+| F2 | MAJOR | `MATCH_PROPOSED` ignored `eligibility` — a NOT_ELIGIBLE request could be matched, stomping the coordinator's spine and consuming an ungranted entitlement at close | the machine now rejects `MATCH_PROPOSED` unless eligibility ∈ {ELIGIBLE, EXCEPTION_GRANTED}; test added |
+| F3 | MAJOR | a HALF_DAY_FREE incident was raised when the FIRST of two undecided clients fell — every sequential full collapse left a stale incident on a CANCELLED day | partner-PENDING arm now releases the half quietly; the incident + rematch fire when (and only when) one side is confirmed — including the confirm-into-half-empty-day order, which now also rematches (symmetric outcome regardless of event order) |
+| F4 | MINOR | escalation windows derived as hardcoded `2×` multipliers | new rules: `matching_escalate_hours`, `missing_info_escalate_days`, `match_approval_escalate_hours` |
+| F5 | MINOR | supplier_portal could UPDATE/DELETE its own SOFT_HELD availability row ("hold sabotage", probe-proven) | write policies now scoped to `status IN (AVAILABLE, BLOCKED, RELEASED)`; DB test proves 0 rows affected |
+| F6 | MINOR | TRUNCATE bypassed the append-only row triggers (probe-proven) | `BEFORE TRUNCATE` statement triggers added on events + entitlement_events; tested |
+| F7 | MINOR | `PAIR_PARTNER_CONFIRMED` disallowed READY while `PAIR_PARTNER_DECLINED` allowed it | READY added |
+| F8 | MINOR | `T1_CONFIRMED` from CONFIRMED with `needs_brief=true` silently vaporized the brief obligation | guarded; test added |
+| F9 | MINOR | two untested arms (cancel+solo-decision variant; SET_ELIGIBILITY effect executor) | tests added — transitions.ts now at 100% lines AND 100% branches |
+| F10 | MINOR | deferred booking effects "after commit" left a CONFIRMED-without-slot crash window | caller contract documented in apply.ts + CLAUDE.md: booking-truth effects run in the caller's outer transaction; only REMATCH_HALF after commit |
+| F11 | MINOR | the invariant-7 RLS tripwire test was deferred to phase 2 while RLS shipped in phase 0 | ported now: supplier A sees zero of supplier B; `relrowsecurity` asserted true so disabling RLS fails loudly; commercial tables return permission-denied |
+| NITs | — | redundant token_hash index; `client_escalate_hours` 72 > hold 48 (unreachable); GUC `''` cast error on pooled connections; supplier name in `client_name` view column; lint warnings passing; CI double-runs; column-name-only drift test; all-weekend config loop | all fixed: index dropped; 72→36 with comment; `app_supplier_id()` helper with `nullif`; view gains `supplier_name`; `--max-warnings 0`; push-only CI trigger; drift test also checks nullability; `addBusinessDays` guards weekend config |
+
+Reviewer verdict after fixes: all four VERIFY gates re-run green (84 tests), coverage
+threshold probe-verified (setting 101% fails the build; coverage-summary.json shows
+transitions.ts at 100/100 lines and branches).

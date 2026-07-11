@@ -18,6 +18,7 @@ import { Rules, RULE } from "./rules";
 import { addHours, addDays, dateAtHourInTz, addBusinessDays, shiftIsoDate } from "./time";
 import {
   TransitionError,
+  type BriefOwner,
   type Effect,
   type NextAction,
   type OwnerType,
@@ -59,7 +60,7 @@ export const ALLOWED: Record<WorkflowEventKind, readonly RequestStatus[]> = {
   CLIENT_CONFIRMED: ["SOFT_HELD"],
   CLIENT_DECLINED: ["SOFT_HELD"],
   HOLD_EXPIRED: ["SOFT_HELD"],
-  PAIR_PARTNER_CONFIRMED: ["SOFT_HELD", "CONFIRMED", "BRIEF_PENDING"],
+  PAIR_PARTNER_CONFIRMED: ["SOFT_HELD", "CONFIRMED", "BRIEF_PENDING", "READY"],
   PAIR_PARTNER_DECLINED: ["SOFT_HELD", "CONFIRMED", "BRIEF_PENDING", "READY"],
   BRIEF_STARTED: ["CONFIRMED", "BRIEF_PENDING"],
   BRIEF_SENT_TO_CLIENT: ["BRIEF_PENDING"],
@@ -121,7 +122,8 @@ function keepSpine(request: RequestSnapshot): Spine {
 /** PENDING_MATCH spine: the system owes the request a match, on a deadline. */
 function pendingMatch(at: Date, rules: Rules): Spine {
   const slaH = rules.int(RULE.matchingSlaHours);
-  return owned("SYSTEM", null, "FIND_SUPPLIER", at, addHours(at, slaH), addHours(at, 2 * slaH));
+  const escalateH = rules.int(RULE.matchingEscalateHours);
+  return owned("SYSTEM", null, "FIND_SUPPLIER", at, addHours(at, slaH), addHours(at, escalateH));
 }
 
 /** Brief must be approved `brief_lead_days` before the shoot: due when day (shoot − lead) ends. */
@@ -141,11 +143,14 @@ function shootEndAt(shootDate: string, rules: Rules): Date {
   return dateAtHourInTz(shootDate, rules.int(RULE.shootDayEndHour), tz);
 }
 
-/** The spine while a brief is being written (owner: whoever writes it). */
-function briefSpine(briefOwnerId: string, shootDate: string, at: Date, rules: Rules): Spine {
+/**
+ * The spine while a brief is being written. The owner is the social manager
+ * for managed clients and the coordinator otherwise — passed in, never assumed.
+ */
+function briefSpine(owner: BriefOwner, shootDate: string, at: Date, rules: Rules): Spine {
   const due = briefDueAt(shootDate, rules);
   const grace = rules.int(RULE.briefEscalateGraceHours);
-  return owned("SOCIAL_MANAGER", briefOwnerId, "WRITE_BRIEF", at, due, addHours(due, grace));
+  return owned(owner.type, owner.id, "WRITE_BRIEF", at, due, addHours(due, grace));
 }
 
 /** The spine while waiting for the supplier's T-1 "talked to the client" press. */
@@ -204,12 +209,12 @@ function freeHalfOrDay(pairing: PairingContext): Effect[] {
     ];
   }
 
-  // partnerStatus === "PENDING" — partner is still deciding; keep the day alive.
-  return [
-    { type: "RELEASE_HALF_DAY", dayId },
-    rematch,
-    { type: "RAISE_INCIDENT", kind: "HALF_DAY_FREE", dayId, shootDate, region },
-  ];
+  // partnerStatus === "PENDING" — partner is still deciding. Release only this
+  // half and stay quiet: nothing is confirmed yet, so there is no half-day
+  // incident to raise (it would go stale if the partner also falls and the
+  // whole day collapses). If the partner later confirms into the half-empty
+  // day, confirmDayEffects raises the incident and the rematch then.
+  return [{ type: "RELEASE_HALF_DAY", dayId }];
 }
 
 /** Day-side consequences when THIS request confirms its slot. */
@@ -224,17 +229,33 @@ function confirmDayEffects(pairing: PairingContext): Effect[] {
     effects.push({ type: "SET_DAY_STATUS", dayId: pairing.dayId, status: "PARTIALLY_CONFIRMED" });
   } else {
     // Partner already fell through; I am confirming into a half-empty day.
+    // Same outcome as "partner falls after I confirmed": the free half goes
+    // back to the matcher and Noam gets one actionable incident.
     effects.push({ type: "SET_DAY_STATUS", dayId: pairing.dayId, status: "PARTIALLY_CONFIRMED" });
-    if (!pairing.supplierAcceptsSoloHalfDay) {
-      effects.push({
-        type: "RAISE_INCIDENT",
-        kind: "SOLO_DAY_DECISION",
-        dayId: pairing.dayId,
-        shootDate: pairing.shootDate,
-        region: pairing.region,
-        proposedResolution: SOLO_DECISION_OPTIONS,
-      });
-    }
+    effects.push({
+      type: "REMATCH_HALF",
+      dayId: pairing.dayId,
+      date: pairing.shootDate,
+      region: pairing.region,
+    });
+    effects.push(
+      pairing.supplierAcceptsSoloHalfDay
+        ? {
+            type: "RAISE_INCIDENT",
+            kind: "HALF_DAY_FREE",
+            dayId: pairing.dayId,
+            shootDate: pairing.shootDate,
+            region: pairing.region,
+          }
+        : {
+            type: "RAISE_INCIDENT",
+            kind: "SOLO_DAY_DECISION",
+            dayId: pairing.dayId,
+            shootDate: pairing.shootDate,
+            region: pairing.region,
+            proposedResolution: SOLO_DECISION_OPTIONS,
+          },
+    );
   }
   return effects;
 }
@@ -264,6 +285,7 @@ export function transition(
 
     case "VALIDATION_FAILED": {
       const staleDays = rules.int(RULE.staleRequestDays);
+      const escalateDays = rules.int(RULE.missingInfoEscalateDays);
       return {
         status: "MISSING_INFO",
         ...owned(
@@ -272,7 +294,7 @@ export function transition(
           "COMPLETE_REQUEST",
           at,
           addDays(at, staleDays),
-          addDays(at, 2 * staleDays),
+          addDays(at, escalateDays),
         ),
         effects: [],
       };
@@ -298,7 +320,18 @@ export function transition(
     }
 
     case "MATCH_PROPOSED": {
+      // The machine, not the matcher, is the eligibility gate: a request whose
+      // eligibility is unresolved is parked with the coordinator, and matching
+      // it would both stomp her spine and let an ungranted entitlement be
+      // consumed at close.
+      if (request.eligibility !== "ELIGIBLE" && request.eligibility !== "EXCEPTION_GRANTED") {
+        throw new TransitionError(
+          "INVALID_TRANSITION",
+          `cannot propose a match while eligibility is ${request.eligibility}`,
+        );
+      }
       const approvalH = rules.int(RULE.matchApprovalHours);
+      const escalateH = rules.int(RULE.matchApprovalEscalateHours);
       return {
         status: "OPTIONS_PROPOSED",
         ...owned(
@@ -307,7 +340,7 @@ export function transition(
           "REVIEW_REQUEST",
           at,
           addHours(at, approvalH),
-          addHours(at, 2 * approvalH),
+          addHours(at, escalateH),
         ),
         effects: [],
       };
@@ -342,7 +375,7 @@ export function transition(
 
     case "CLIENT_CONFIRMED": {
       const spine = request.needsBrief
-        ? briefSpine(event.briefOwnerId, event.pairing.shootDate, at, rules)
+        ? briefSpine(event.briefOwner, event.pairing.shootDate, at, rules)
         : t1Spine(event.supplierId, event.pairing.shootDate, at, rules);
       return { status: "CONFIRMED", ...spine, effects: confirmDayEffects(event.pairing) };
     }
@@ -366,7 +399,7 @@ export function transition(
     case "BRIEF_STARTED": {
       return {
         status: "BRIEF_PENDING",
-        ...briefSpine(event.briefOwnerId, event.shootDate, at, rules),
+        ...briefSpine(event.briefOwner, event.shootDate, at, rules),
         effects: [],
       };
     }
@@ -392,7 +425,7 @@ export function transition(
       // The brief deadline does not move because the client asked for changes.
       return {
         status: "BRIEF_PENDING",
-        ...briefSpine(event.briefOwnerId, event.shootDate, at, rules),
+        ...briefSpine(event.briefOwner, event.shootDate, at, rules),
         effects: [],
       };
     }
@@ -415,6 +448,14 @@ export function transition(
     }
 
     case "T1_CONFIRMED": {
+      // From CONFIRMED this shortcut is only legal when no brief is owed —
+      // otherwise the brief obligation would silently vanish from the spine.
+      if (request.status === "CONFIRMED" && request.needsBrief) {
+        throw new TransitionError(
+          "INVALID_TRANSITION",
+          "T1_CONFIRMED cannot skip a required brief (request is CONFIRMED with needs_brief=true)",
+        );
+      }
       const due = shootEndAt(event.shootDate, rules);
       return {
         status: "READY",

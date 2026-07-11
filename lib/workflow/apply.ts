@@ -8,8 +8,21 @@
  *   4. writes the request AND an append-only `events` row together — always,
  *   5. executes the transactional effects (incident, day status, eligibility,
  *      entitlement consumption, day release) in the SAME transaction,
- *   6. returns the non-transactional effects ("deferred") to the caller —
- *      e.g. REMATCH_HALF, which the service layer runs after commit.
+ *   6. returns the effects it cannot execute at this layer ("deferred").
+ *
+ * CALLER CONTRACT for deferred effects — this is booking truth, so it is not
+ * optional: CONFIRM_SLOT, RELEASE_HALF_DAY and SUPERSEDE_PROPOSALS must be
+ * executed in the SAME outer transaction as the transition. Services do that
+ * by opening the transaction themselves and passing it in:
+ *
+ *   await db().transaction(async (tx) => {
+ *     const { deferred } = await applyTransition(tx, id, event);
+ *     await executeBookingEffects(tx, deferred);   // before commit!
+ *   });
+ *
+ * Only REMATCH_HALF (kicking the matcher) may run after commit. A crash
+ * between commit and a booking effect would otherwise leave a CONFIRMED
+ * request with no confirmed slot and no recovery event.
  *
  * If the transition is invalid, the transaction aborts and NOTHING is written.
  */

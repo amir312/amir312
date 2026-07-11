@@ -106,6 +106,12 @@ interface Base {
   actor: Actor;
 }
 
+/** Who owns writing/fixing the brief — the SM for managed clients, Noam otherwise. */
+export interface BriefOwner {
+  type: "SOCIAL_MANAGER" | "COORDINATOR";
+  id: string;
+}
+
 export type WorkflowEvent =
   | (Base & { kind: "REQUEST_SUBMITTED"; submitterId: string })
   | (Base & { kind: "VALIDATION_FAILED"; submitterId: string; missingFields: string[] })
@@ -125,8 +131,8 @@ export type WorkflowEvent =
       shootDate: string;
       confirmedBy: "CLIENT" | "SOCIAL_MANAGER" | "COORDINATOR";
       pairing: PairingContext;
-      /** Who owns writing the brief (social manager for managed clients, coordinator otherwise). */
-      briefOwnerId: string;
+      /** Who owns writing the brief: the social manager for managed clients, the coordinator otherwise. */
+      briefOwner: BriefOwner;
       supplierId: string;
     })
   | (Base & { kind: "CLIENT_DECLINED"; pairing: PairingContext })
@@ -137,10 +143,10 @@ export type WorkflowEvent =
       partnerRequestId: string;
       cause: "DECLINED" | "HOLD_EXPIRED" | "CANCELLED";
     })
-  | (Base & { kind: "BRIEF_STARTED"; shootDate: string; briefOwnerId: string })
+  | (Base & { kind: "BRIEF_STARTED"; shootDate: string; briefOwner: BriefOwner })
   | (Base & { kind: "BRIEF_SENT_TO_CLIENT"; approver: { type: "CLIENT" | "SOCIAL_MANAGER"; id: string } })
   | (Base & { kind: "BRIEF_APPROVED" })
-  | (Base & { kind: "BRIEF_CHANGES_REQUESTED"; shootDate: string; briefOwnerId: string; feedback?: string })
+  | (Base & { kind: "BRIEF_CHANGES_REQUESTED"; shootDate: string; briefOwner: BriefOwner; feedback?: string })
   | (Base & { kind: "BRIEF_SENT_TO_SUPPLIER"; supplierId: string; shootDate: string })
   | (Base & { kind: "T1_CONFIRMED"; supplierId: string; shootDate: string })
   | (Base & { kind: "T1_MISSED" })

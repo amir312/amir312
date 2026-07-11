@@ -3,6 +3,7 @@
  * invariants hold even against buggy code that bypasses the service layer.
  */
 import { eq } from "drizzle-orm";
+import type postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import * as s from "./schema";
 import {
@@ -204,6 +205,121 @@ describe("invariant 3 — events are append-only", () => {
   });
 });
 
+describe("invariant 7 — supplier isolation is a database fact", () => {
+  /** Run `fn` as the supplier_portal role scoped to `supplierId`, like portal code will. */
+  async function asSupplier<T>(
+    supplierId: string,
+    fn: (tx: postgres.TransactionSql) => Promise<T>,
+  ): Promise<T> {
+    return (await t.sql.begin(async (tx) => {
+      await tx.unsafe(`set local role supplier_portal`);
+      await tx`select set_config('app.supplier_id', ${supplierId}, true)`;
+      return fn(tx);
+    })) as T;
+  }
+
+  it("RLS is enabled on every supplier-visible table — fails loudly if anyone disables it", async () => {
+    const rows = await t.sql<{ relname: string; relrowsecurity: boolean }[]>`
+      select relname, relrowsecurity from pg_class
+      where relname in ('suppliers','supplier_days','shoot_slots','supplier_availability','deliverables')
+    `;
+    expect(rows).toHaveLength(5);
+    for (const r of rows) {
+      expect(r.relrowsecurity, `RLS DISABLED on ${r.relname}`).toBe(true);
+    }
+  });
+
+  it("supplier A sees zero rows belonging to supplier B", async () => {
+    const a = await seedSupplier(t.db, { name: "צלם א" });
+    const b = await seedSupplier(t.db, { name: "צלם ב" });
+    await seedDay(t.db, a.id, { date: "2026-09-01" });
+    await seedDay(t.db, b.id, { date: "2026-09-01" });
+    await seedAvailability(t.db, a.id, { date: "2026-09-01" });
+    await seedAvailability(t.db, b.id, { date: "2026-09-01" });
+
+    const seen = await asSupplier(a.id, async (tx) => ({
+      suppliers: await tx<{ id: string }[]>`select id from suppliers`,
+      days: await tx<{ id: string; supplier_id: string }[]>`select id, supplier_id from supplier_days`,
+      availability: await tx<
+        { id: string; supplier_id: string }[]
+      >`select id, supplier_id from supplier_availability`,
+    }));
+    expect(seen.suppliers.map((r) => r.id)).toEqual([a.id]);
+    expect(seen.days.every((r) => r.supplier_id === a.id)).toBe(true);
+    expect(seen.days.length).toBeGreaterThan(0);
+    expect(seen.availability.every((r) => r.supplier_id === a.id)).toBe(true);
+
+    // Without the GUC set at all: fail closed — zero rows.
+    const blind = await t.sql.begin(async (tx) => {
+      await tx.unsafe(`set local role supplier_portal`);
+      return tx`select id from supplier_days`;
+    });
+    expect(blind).toHaveLength(0);
+  });
+
+  it("a supplier connection cannot read commercial tables at all", async () => {
+    const a = await seedSupplier(t.db);
+    for (const table of ["clients", "shoot_requests", "rules", "events", "briefs", "incidents", "entitlement_events", "access_tokens", "notifications", "slot_proposals", "users"]) {
+      await expectDbError(
+        asSupplier(a.id, (tx) => tx.unsafe(`select * from ${table} limit 1`)),
+        /permission denied/,
+      );
+    }
+  });
+
+  it("a supplier cannot sabotage its own live hold (invariant 4 at the DB layer)", async () => {
+    const a = await seedSupplier(t.db);
+    const held = await seedAvailability(t.db, a.id, {
+      date: "2026-09-02",
+      status: "SOFT_HELD",
+      heldUntil: new Date(Date.now() + 48 * 3_600_000),
+    });
+
+    const { updated, deleted, after } = await asSupplier(a.id, async (tx) => {
+      const updated = await tx`
+        update supplier_availability set status = 'AVAILABLE', held_until = null
+        where id = ${held.id}
+      `;
+      const deleted = await tx`delete from supplier_availability where id = ${held.id}`;
+      const after = await tx<
+        { status: string; held_until: Date | null }[]
+      >`select status, held_until from supplier_availability where id = ${held.id}`;
+      return { updated: updated.count, deleted: deleted.count, after };
+    });
+    expect(updated).toBe(0);
+    expect(deleted).toBe(0);
+    expect(after[0].status).toBe("SOFT_HELD");
+
+    // A free window remains editable — that is the supplier's own calendar.
+    const free = await seedAvailability(t.db, a.id, { date: "2026-09-03" });
+    const freed = await asSupplier(a.id, async (tx) => {
+      const res = await tx`update supplier_availability set note = 'רק בוקר' where id = ${free.id}`;
+      return res.count;
+    });
+    expect(freed).toBe(1);
+  });
+
+  it("a supplier cannot insert availability for another supplier", async () => {
+    const a = await seedSupplier(t.db);
+    const b = await seedSupplier(t.db);
+    await expectDbError(
+      asSupplier(a.id, (tx) =>
+        tx.unsafe(
+          `insert into supplier_availability (supplier_id, date, start_time, end_time) values ('${b.id}', '2026-09-04', '08:00', '12:00')`,
+        ),
+      ),
+      /row-level security|permission denied/,
+    );
+  });
+});
+
+describe("TRUNCATE cannot bypass append-only", () => {
+  it("TRUNCATE on events / entitlement_events is rejected", async () => {
+    await expectDbError(t.sql.unsafe(`truncate events`), /append-only/);
+    await expectDbError(t.sql.unsafe(`truncate entitlement_events`), /append-only/);
+  });
+});
+
 describe("exceptions view", () => {
   it("an overdue open request appears; a future-dated one does not", async () => {
     // The view compares against now(), so these fixtures are clock-relative.
@@ -248,15 +364,17 @@ describe("exceptions view", () => {
       })
       .returning();
 
-    let rows = await t.sql<{ incident_id: string | null; severity: string; client_name: string }[]>`
-      select incident_id, severity, client_name from exceptions where incident_id = ${inc.id}
+    let rows = await t.sql<
+      { incident_id: string | null; severity: string; supplier_name: string | null }[]
+    >`
+      select incident_id, severity, supplier_name from exceptions where incident_id = ${inc.id}
     `;
     expect(rows).toHaveLength(1);
     expect(rows[0].severity).toBe("ESCALATED");
-    expect(rows[0].client_name).toBe("רן ברק");
+    expect(rows[0].supplier_name).toBe("רן ברק");
 
     await t.db.update(s.incidents).set({ resolvedAt: new Date() }).where(eq(s.incidents.id, inc.id));
-    rows = await t.sql`select incident_id, severity, client_name from exceptions where incident_id = ${inc.id}`;
+    rows = await t.sql`select incident_id, severity, supplier_name from exceptions where incident_id = ${inc.id}`;
     expect(rows).toHaveLength(0);
   });
 });

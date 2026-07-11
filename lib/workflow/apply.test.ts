@@ -183,6 +183,38 @@ describe("applyTransition", () => {
     expect(dayRow.status).toBe("PARTIALLY_CONFIRMED");
   });
 
+  it("ELIGIBILITY_FLAGGED and EXCEPTION_GRANTED persist the eligibility flag via effects", async () => {
+    const req = await seedRequest(t.db, clientId, smId, {
+      status: "PENDING_MATCH",
+      eligibility: "NEEDS_CHECK",
+      ...validSpine(AT),
+    });
+    await applyTransition(t.db, req.id, {
+      kind: "ELIGIBILITY_FLAGGED",
+      at: AT,
+      actor,
+      eligibility: "NOT_ELIGIBLE",
+      note: "אין יתרה בחבילה",
+    });
+    let [row] = await t.db.select().from(s.shootRequests).where(eq(s.shootRequests.id, req.id));
+    expect(row.eligibility).toBe("NOT_ELIGIBLE");
+    expect(row.eligibilityNote).toBe("אין יתרה בחבילה");
+    expect(row.currentOwnerType).toBe("COORDINATOR");
+    expect(row.currentAction).toBe("GRANT_EXCEPTION");
+    expect(row.escalateAt).toEqual(AT); // immediately Noam's problem
+
+    await applyTransition(t.db, req.id, {
+      kind: "EXCEPTION_GRANTED",
+      at: new Date(AT.getTime() + 3_600_000),
+      actor: { type: "COORDINATOR" },
+      note: "אושר",
+    });
+    [row] = await t.db.select().from(s.shootRequests).where(eq(s.shootRequests.id, req.id));
+    expect(row.eligibility).toBe("EXCEPTION_GRANTED");
+    expect(row.currentOwnerType).toBe("SYSTEM");
+    expect(row.currentAction).toBe("FIND_SUPPLIER");
+  });
+
   it("REQUEST_CLOSED consumes the entitlement in the ledger (SUM(delta) drops by 1)", async () => {
     await t.db.insert(s.entitlementEvents).values({
       clientId,

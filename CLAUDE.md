@@ -175,7 +175,11 @@ Say no if asked. They are all reasonable later; they all sink the pilot now.
 - **The transition function returns declarative `Effect`s.** `apply.ts` executes the
   transactional ones (incident insert, day status, availability release, eligibility flag,
   entitlement CONSUME) inside the same transaction, and returns the rest (`RELEASE_HALF_DAY`,
-  `CONFIRM_SLOT`, `SUPERSEDE_PROPOSALS`, `REMATCH_HALF`) as `deferred` for the service layer.
+  `CONFIRM_SLOT`, `SUPERSEDE_PROPOSALS`, `REMATCH_HALF`) as `deferred`.
+  **Deferred-effects contract:** booking-truth effects (`CONFIRM_SLOT`, `RELEASE_HALF_DAY`,
+  `SUPERSEDE_PROPOSALS`) MUST be executed in the same outer transaction — services open the
+  transaction themselves and pass it to `applyTransition(tx, …)`. Only `REMATCH_HALF` may run
+  after commit. Never fire-and-forget a booking effect.
 - **Pairing truth is passed in, never guessed:** callers assemble `PairingContext`
   (incl. `partnerStatus`) inside the same transaction that applies the event. When a whole day
   expires with zero confirmations, the expiry job passes `partnerStatus: "RELEASED"` for both
