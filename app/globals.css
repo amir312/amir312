@@ -1,26 +1,75 @@
 @import "tailwindcss";
 
+/*
+ * ShootOps design tokens — operational command center.
+ * Calm neutral surface, one loud severity scale. Hebrew-first, RTL.
+ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: oklch(0.985 0.002 90);
+  --foreground: oklch(0.2 0.01 260);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0.01 260);
+  --muted: oklch(0.955 0.004 90);
+  --muted-foreground: oklch(0.5 0.012 260);
+  --primary: oklch(0.32 0.03 260);
+  --primary-foreground: oklch(0.985 0.002 90);
+  --secondary: oklch(0.94 0.006 90);
+  --secondary-foreground: oklch(0.3 0.02 260);
+  --accent: oklch(0.94 0.006 90);
+  --accent-foreground: oklch(0.3 0.02 260);
+  --destructive: oklch(0.55 0.2 27);
+  --destructive-foreground: oklch(0.99 0 0);
+  --border: oklch(0.913 0.006 90);
+  --input: oklch(0.913 0.006 90);
+  --ring: oklch(0.55 0.05 260);
+  --radius: 0.625rem;
+
+  /* severity scale — the only loud colors on the screen */
+  --sev-escalated: oklch(0.55 0.2 27);
+  --sev-escalated-bg: oklch(0.97 0.02 27);
+  --sev-overdue: oklch(0.68 0.15 65);
+  --sev-overdue-bg: oklch(0.975 0.025 80);
+  --sev-ok: oklch(0.6 0.12 155);
+  --sev-ok-bg: oklch(0.97 0.02 155);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sev-escalated: var(--sev-escalated);
+  --color-sev-escalated-bg: var(--sev-escalated-bg);
+  --color-sev-overdue: var(--sev-overdue);
+  --color-sev-overdue-bg: var(--sev-overdue-bg);
+  --color-sev-ok: var(--sev-ok);
+  --color-sev-ok-bg: var(--sev-ok-bg);
+  --font-sans: var(--font-heebo), system-ui, sans-serif;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-heebo), system-ui, sans-serif;
+}
+
+* {
+  border-color: var(--border);
 }

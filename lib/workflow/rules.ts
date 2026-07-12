@@ -69,6 +69,8 @@ export const RULE = {
   matchApprovalEscalateHours: "match_approval_escalate_hours",
   shootDayEndHour: "shoot_day_end_hour",
   supplierAvailabilityWeeks: "supplier_availability_weeks",
+  upcomingHorizonDays: "upcoming_horizon_days",
+  reminderWindowHours: "reminder_window_hours",
   timezone: "timezone",
   weekendDays: "weekend_days",
   notifyChannelDefault: "notify_channel_default",

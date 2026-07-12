@@ -94,3 +94,68 @@ typecheck/lint/tests/build and live DB probes):
 Reviewer verdict after fixes: all four VERIFY gates re-run green (84 tests), coverage
 threshold probe-verified (setting 101% fails the build; coverage-summary.json shows
 transitions.ts at 100/100 lines and branches).
+
+---
+
+## Phase 1 — Intake and the Exceptions Console
+
+**Built:**
+- `/requests/new` + `/requests/[id]/edit` — the structured intake form (RTL, Hebrew, grouped
+  sections). Validation is SERVER-side zod (`lib/validation/request.ts`): an incomplete request
+  is persisted and routed to `MISSING_INFO` with the missing fields NAMED, ownership back to the
+  submitter; a complete one enters `PENDING_MATCH`. Eligibility is decided server-side from the
+  entitlement ledger (`SUM(delta)`): no balance with history → `NOT_ELIGIBLE`, no history →
+  `NEEDS_CHECK` — both park with the coordinator as an immediately-visible exception.
+- `/` — the Exceptions Console, Noam's home screen: reads the `exceptions` VIEW (no alerts
+  table), one card per exception with what happened · who is holding it · how long · severity ·
+  the recommended action from `lib/workflow/suggestions.ts` (deterministic map) · ONE button that
+  executes it via `applyTransition`. Below: the calm upcoming-shoots list (today / tomorrow /
+  this week, horizon from `rules`), with paired days and free half-days flagged.
+- `/requests/[id]` — request page with spine card (owner / next action / deadline) and the
+  unified timeline read from `events`.
+- `lib/services/{requests,console,holds}.ts` — the service layer: every state change through
+  `applyTransition` in a transaction; booking-truth deferred effects executed in the SAME
+  transaction (`executeBookingEffects` + `assertOnlyRematchDeferred` guard).
+- `lib/notify` — `Notifier` interface + Console adapter; every send carries an idempotency key
+  (windowed by `rules.reminder_window_hours`); the notification row and its timeline entry are
+  written in one transaction; FAILED sends stay retriable; SENT duplicates are suppressed.
+- `lib/auth.ts` — clearly-marked pilot auth shim ("act as" switcher, attribution only).
+- `db/seed.ts` — recreates the dev DB and drives REAL transitions to produce all six exception
+  types + an eligibility hold + a confirmed paired day for the upcoming list.
+- e2e (Playwright, desktop + 390px): all six console buttons execute valid transitions
+  (DB-visible outcomes), intake round-trip, visual screenshots into `docs/screenshots/`.
+
+**Acceptance criteria (executed, not assumed):**
+
+| criterion | result |
+| --- | --- |
+| After seeding, the console shows six exceptions with six DIFFERENT recommended actions | **PASS** — 7 rows (6 required types + eligibility hold), 7 distinct actions; asserted in e2e and in the exceptions-view SQL |
+| Every button executes a valid transition | **PASS** — e2e clicks all of them: release-expired-hold → PENDING_MATCH + availability freed; resolve half-day; brief reminder (2nd click = duplicate); mark T-1; deliverables reminder; approve match; grant exception |
+| Incomplete request → MISSING_INFO with named fields, ownership back to submitter | **PASS** — e2e + service tests against real PG |
+| Eligibility NEEDS_CHECK / NOT_ELIGIBLE routes to Noam | **PASS** — service test both routes; visible immediately (escalate_at = now) |
+| `pnpm typecheck` / `lint` / `test` / `build` | **PASS** ×4 — 100 unit/DB tests |
+| VISUAL: desktop + 390px screenshots reviewed | **PASS** — fixed: raw region code was showing in incident titles (now Hebrew via `regionLabels`) |
+
+**Reviewer findings and fixes** (fresh-context subagent; re-verified after fixes — 100 tests,
+15 e2e, all gates green):
+
+| # | severity | finding | resolution |
+| --- | --- | --- | --- |
+| P1-1 | MAJOR | every date from the exceptions view was an Invalid Date (PG returns `+00` offsets V8 rejects); deadline sort was a silent no-op | `toDate()` normalizes the offset and THROWS on unparseable input; regression test asserts real `Date` instances |
+| P1-2 | MAJOR | SOFT_HELD rows unconditionally recommended "release the hold" — one click could kill a LIVE, rescuable booking (console shows the row at +24h, hold lives to +48h); REMIND_CLIENT_DATE existed but was unreachable | `suggestFor` now takes hold liveness (computed per request from `supplier_availability.held_until`): live → reminder, expired → release; unknown defaults to reminder; `expireHold` additionally REFUSES a live hold unless forced; tests both layers |
+| P1-3 | MINOR | suggestion server action trusted client input (`as SuggestionKey`, raw ids) | zod schema over `SUGGESTION_KEYS` + uuid checks; forged keys get a Hebrew error, not a 500 |
+| P1-4 | MINOR | timezone + upcoming horizon + reminder window hardcoded | now from `rules`: `timezone` threaded to header/services/seed; new `upcoming_horizon_days`, `reminder_window_hours` keys |
+| P1-5 | MINOR | three inline Hebrew strings outside he.ts | moved to `errors` / `timelineNotes` namespaces |
+| P1-6 | MINOR | reminder row + timeline event were two separate writes; FAILED sends blocked retries for the rest of the window | `sendNotification` now records both in ONE transaction via a `record` hook; FAILED rows are retried on the same idempotency key; SENT → DUPLICATE (tested with a flaky adapter) |
+| P1-7 | MINOR | seed ran booking effects in a separate transaction from the transition (contract violation) and hand-materialized CONFIRM_SLOT | decline flow now transition+effects in one tx; `confirmSlot` wrapped in a tx with a reconcile-with-phase-3 note |
+| NITs | — | eligibility auto-check invisible on the timeline; incidents got `now()` instead of the event time; timeline query unscoped by entity type; suggestion switch could fall through on forged keys; user-switch cookie flags; unexecuted-deferred asserts | all fixed: `ELIGIBILITY_CHECKED` timeline event; incidents backdated to `event.at`; entityType filter; explicit fallback branch; `sameSite=lax` + `secure` in prod; `assertOnlyRematchDeferred` after every service transition |
+
+**Decisions the spec did not dictate:**
+1. The console recommends **rescue before release**: a live hold's one-click action is a client
+   reminder; the release button appears only once the hold has genuinely expired. Releasing a
+   live hold now requires `force` at the service layer.
+2. Reminder idempotency is windowed (`reminder_window_hours`, default 24h) rather than
+   calendar-day keyed, so a 23:50 reminder doesn't become re-sendable at midnight.
+3. The auth shim is a cookie-based "act as" switcher for the pilot (attribution only, clearly
+   marked); real Supabase Auth lands before external exposure.
+4. `getUpcoming` flags `halfFree` days so the pairing opportunity is visible in phase 1 already.

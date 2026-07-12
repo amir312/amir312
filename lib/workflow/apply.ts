@@ -188,6 +188,7 @@ export async function applyTransition(
             summary,
             reason: effect.reason ?? null,
             proposedResolution: effect.proposedResolution ?? null,
+            createdAt: event.at,
           });
           // The incident is part of the request's story too.
           await tx.insert(events).values({

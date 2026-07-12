@@ -15,12 +15,16 @@
     "db:seed": "tsx db/seed.ts"
   },
   "dependencies": {
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
     "drizzle-orm": "^0.45.2",
     "inngest": "^4.12.1",
+    "lucide-react": "^1.24.0",
     "next": "15.5.20",
     "postgres": "^3.4.9",
     "react": "19.1.0",
     "react-dom": "19.1.0",
+    "tailwind-merge": "^3.6.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

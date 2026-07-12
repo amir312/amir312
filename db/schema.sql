@@ -42,6 +42,8 @@ insert into rules (key, value, description) values
   ('match_approval_escalate_hours',   '48',      'An unreviewed proposal past this is escalated'),
   ('shoot_day_end_hour',              '20',      'Local hour by which a shoot day is considered over'),
   ('supplier_availability_weeks',     '3',       'How many weeks ahead the availability link collects'),
+  ('upcoming_horizon_days',           '7',       'How many days ahead the console''s upcoming-shoots list looks'),
+  ('reminder_window_hours',           '24',      'A manual reminder for the same request can be re-sent after this window'),
   ('timezone',                        '"Asia/Jerusalem"', 'Timezone used to interpret hour-of-day rules'),
   ('weekend_days',                    '[5,6]',   'Days counted as weekend for business-day math (JS getDay: 0=Sunday … 5=Friday, 6=Saturday)'),
   ('notify_channel_default',          '"CONSOLE"', 'Default outbound channel: CONSOLE | EMAIL | WHATSAPP');
@@ -207,6 +209,7 @@ create table shoot_requests (
   client_windows    jsonb not null default '[]', -- [{from,to}] — the SM enters these at intake
   target_date       date,
   flexibility       text,                        -- 'HIGH'|'MEDIUM'|'LOW'
+  special_requirements text,
   notes             text,
 
   -- eligibility: a flag in the MVP, not an engine (invariant 8)

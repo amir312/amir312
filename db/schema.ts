@@ -232,6 +232,7 @@ export const shootRequests = pgTable("shoot_requests", {
   clientWindows: jsonb("client_windows").notNull().default([]),
   targetDate: date("target_date"),
   flexibility: text("flexibility"),
+  specialRequirements: text("special_requirements"),
   notes: text("notes"),
 
   eligibility: text("eligibility").notNull().default("NEEDS_CHECK"),

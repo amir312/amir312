@@ -5,6 +5,7 @@
  */
 import type { WorkflowEvent } from "@/lib/workflow/types";
 import type { IncidentKind, NextAction, OwnerType, RequestStatus } from "@/lib/workflow/types";
+import type { SuggestionKey } from "@/lib/workflow/suggestions";
 
 export const appName = "ShootOps";
 
@@ -50,11 +51,47 @@ export const actionLabels: Record<NextAction, string> = {
   NONE: "—",
 };
 
+export const shootTypeLabels: Record<string, string> = {
+  STILLS: "סטילס",
+  VIDEO: "וידאו",
+  CONTENT_CREATION: "יצירת תוכן",
+};
+
 export const severityLabels: Record<string, string> = {
   ESCALATED: "דורש טיפול מיידי",
   OVERDUE: "באיחור",
   AT_RISK: "בסיכון",
 };
+
+/** User-facing error lines (server actions render these verbatim). */
+export const errors = {
+  choosePrereqs: "בחרו לקוח וסוג צילום — בלעדיהם אין למה לפתוח בקשה",
+  invalidAction: "הפעולה לא זוהתה — רעננו את המסך ונסו שוב",
+  holdStillLive: "השמירה עדיין בתוקף — שלחו ללקוח תזכורת במקום לשחרר אותה",
+};
+
+/** Timeline annotations the services write directly (not via workflow events). */
+export const timelineNotes = {
+  reminderSent: (recipientName: string) => `נשלחה תזכורת אל ${recipientName}`,
+  incidentResolved: (note?: string | null) => (note ? `החריג טופל — ${note}` : "החריג טופל"),
+  eligibilityAutoOk: "זכאות אומתה — קיימת יתרה פנויה בחבילה",
+};
+
+/** Region codes are internal — users always see these. */
+export const regionLabels: Record<string, string> = {
+  TLV: "תל אביב והמרכז",
+  SHARON: "השרון",
+  SHFELA: "השפלה",
+  JERUSALEM: "ירושלים והסביבה",
+  HAIFA: "חיפה",
+  SOUTH: "הדרום",
+  NORTH: "הצפון",
+};
+
+export function regionLabel(code: string | null | undefined): string | null {
+  if (!code) return null;
+  return regionLabels[code] ?? code;
+}
 
 /** Intake field labels — used both by the form and by VALIDATION_FAILED summaries. */
 export const fieldLabels: Record<string, string> = {
@@ -68,6 +105,7 @@ export const fieldLabels: Record<string, string> = {
   client_windows: "חלונות זמן של הלקוח",
   target_date: "תאריך יעד",
   flexibility: "גמישות",
+  special_requirements: "דרישות מיוחדות",
 };
 
 function fieldList(fields: string[]): string {
@@ -159,12 +197,186 @@ export function eventSummary(event: WorkflowEvent): string {
   }
 }
 
+/** Button label + one-line explanation per recommended action. */
+export const suggestionLabels: Record<SuggestionKey, { button: string; explain: string }> = {
+  RELEASE_EXPIRED_HOLD: {
+    button: "שחרר את השמירה",
+    explain: "השמירה פגה ללא מענה — שחרור יחזיר את הבקשה לתור השיבוץ ויפנה את יום הצלם",
+  },
+  APPROVE_MATCH: {
+    button: "אשר את השיבוץ",
+    explain: "הצעת שיבוץ ממתינה לאישורך — אישור ישמור את יום הצלם וישלח הצעות מועד",
+  },
+  GRANT_EXCEPTION: {
+    button: "אשר חריגת זכאות",
+    explain: "ללקוח אין זכאות פנויה — אישור יחזיר את הבקשה לתור השיבוץ",
+  },
+  MARK_T1_CONFIRMED: {
+    button: "סמן: תואם מול הלקוח",
+    explain: "הצלם לא אישר תיאום — אם וידאת טלפונית, סמני וזה ירד מהמסך",
+  },
+  MARK_SHOT: {
+    button: "סמן שהצילום בוצע",
+    explain: "יום הצילום עבר — סימון יפתח את מעקב מסירת התוצרים",
+  },
+  FORWARD_NOW: {
+    button: "העבר את התוצרים",
+    explain: "התוצרים התקבלו אך טרם הועברו — העברה תסגור את הבקשה ותנצל את הזכאות",
+  },
+  CLOSE_REQUEST: {
+    button: "סגור את הבקשה",
+    explain: "הכל הושלם — סגירה תנצל את הזכאות ותסיים את הטיפול",
+  },
+  REMIND_SUBMITTER: {
+    button: "שלח תזכורת למגיש",
+    explain: "הבקשה ממתינה להשלמת פרטים אצל המגיש",
+  },
+  REMIND_BRIEF_OWNER: {
+    button: "שלח תזכורת על הבריף",
+    explain: "הבריף מאחר — תזכורת לאחראי הבריף",
+  },
+  REMIND_CLIENT_BRIEF: {
+    button: "שלח תזכורת ללקוח",
+    explain: "הלקוח טרם אישר את הבריף",
+  },
+  REMIND_CLIENT_DATE: {
+    button: "שלח תזכורת ללקוח",
+    explain: "הלקוח טרם בחר מועד",
+  },
+  REMIND_SUPPLIER_DELIVERABLES: {
+    button: "שלח תזכורת לצלם",
+    explain: "התוצרים באיחור — תזכורת לצלם עם הדדליין",
+  },
+  RESOLVE_HALF_DAY: {
+    button: "סמן כטופל",
+    explain: "חצי יום התפנה — שבצי לקוח מחליף (מועמדים יוצגו כאן בפאזה הבאה) או סגרי את החריג",
+  },
+  RESOLVE_SOLO_DECISION: {
+    button: "התקבלה החלטה — סגור",
+    explain: "הצלם לא מקבל חצי יום בודד: מצאי לקוח מחליף או אשרי תוספת יום בודד — ההחלטה שלך",
+  },
+  RESOLVE_CANCELLATION: {
+    button: "טופל — סגור חריג",
+    explain: "ביטול דורש טיפול ידני — סגרי לאחר שההמשך סוכם",
+  },
+  RUN_MATCHER: {
+    button: "פתח את הבקשה",
+    explain: "אין עדיין שיבוץ — מנוע השיבוץ יציע מועמדים בפאזה הבאה",
+  },
+  OPEN_REQUEST: {
+    button: "פתח את הבקשה",
+    explain: "",
+  },
+};
+
+/** "What happened" headline per (status, action) — the first line Noam reads. */
+export function exceptionHeadline(status: string | null, action: string | null): string {
+  const key = `${status}:${action}`;
+  const map: Record<string, string> = {
+    "MISSING_INFO:COMPLETE_REQUEST": "בקשה תקועה — חסרים פרטים מהמגיש",
+    "PENDING_MATCH:FIND_SUPPLIER": "בקשה ממתינה לשיבוץ מעבר לזמן הסביר",
+    "PENDING_MATCH:GRANT_EXCEPTION": "נדרשת הכרעת זכאות",
+    "OPTIONS_PROPOSED:REVIEW_REQUEST": "הצעת שיבוץ ממתינה לאישורך",
+    "OPTIONS_PROPOSED:NONE": "המערכת נתקעה בשמירת היום — נדרש טיפול",
+    "SOFT_HELD:CHOOSE_DATE": "השמירה פגה — הלקוח לא בחר מועד",
+    "CONFIRMED:WRITE_BRIEF": "הבריף מאחר",
+    "BRIEF_PENDING:WRITE_BRIEF": "הבריף מאחר",
+    "BRIEF_PENDING:APPROVE_BRIEF": "הלקוח לא אישר את הבריף",
+    "BRIEF_PENDING:SEND_BRIEF_TO_SUPPLIER": "בריף מאושר שלא נשלח לצלם",
+    "CONFIRMED:CONFIRM_CLIENT_CONTACT": "הצלם לא אישר תיאום מול הלקוח",
+    "READY:CONFIRM_CLIENT_CONTACT": "הצלם לא אישר תיאום מול הלקוח",
+    "READY:RUN_SHOOT": "יום הצילום עבר ולא עודכן",
+    "AWAITING_DELIVERY:UPLOAD_DELIVERABLES": "התוצרים באיחור",
+    "DELIVERED:FORWARD_DELIVERABLES": "תוצרים שהתקבלו ולא הועברו",
+    "DELIVERED:NONE": "בקשה שהסתיימה ולא נסגרה",
+  };
+  return map[key] ?? "בקשה תקועה";
+}
+
+export const console_ = {
+  title: "מה דורש טיפול",
+  empty: "אין חריגים כרגע — הכל זורם",
+  emptyUpcoming: "אין ימי צילום קרובים",
+  upcomingTitle: "ימי צילום קרובים",
+  today: "היום",
+  tomorrow: "מחר",
+  thisWeek: "השבוע הקרוב",
+  stuckDays: (d: number) => (d < 1 ? "פחות מיום" : d < 2 ? "יום אחד" : `${Math.floor(d)} ימים`),
+  heldBy: "אצל",
+  openRequest: "פתח בקשה",
+  newRequest: "בקשת צילום חדשה",
+  reminderSent: "התזכורת נשלחה",
+  reminderAlready: "כבר נשלחה תזכורת היום",
+  done: "בוצע",
+  actAs: "פועל בתור",
+  greetingMorning: "בוקר טוב",
+  greetingNoon: "צהריים טובים",
+  greetingEvening: "ערב טוב",
+  paired: "מזווג",
+  halfDayFree: "חצי יום פנוי",
+};
+
+export const form = {
+  title: "בקשת יום צילום",
+  subtitle: "בקשה מלאה נכנסת ישירות לתור השיבוץ. בקשה חלקית תישמר ותחזור אליך להשלמה.",
+  client: "לקוח",
+  clientPlaceholder: "בחרו לקוח…",
+  shootType: "סוג צילום",
+  shootTypes: { STILLS: "סטילס", VIDEO: "וידאו", CONTENT_CREATION: "יצירת תוכן" } as Record<string, string>,
+  sectionLocation: "מיקום הצילום",
+  address: "כתובת מדויקת",
+  region: "אזור",
+  regions: regionLabels,
+  sectionContact: "איש קשר בשטח",
+  contactName: "שם",
+  contactPhone: "טלפון",
+  sectionContent: "מה מצלמים",
+  purpose: "מטרת הצילום",
+  purposePlaceholder: "למשל: צילומי מוצר לקמפיין קיץ, 12 מנות חדשות לתפריט…",
+  needsBrief: "נדרש בריף",
+  needsScript: "נדרש תסריט",
+  specialRequirements: "דרישות מיוחדות",
+  specialPlaceholder: "ציוד מיוחד, הכנות נדרשות, אנשים שחייבים להיות באתר…",
+  notes: "הערות",
+  sectionWindows: "מתי נוח ללקוח",
+  windowFrom: "מתאריך",
+  windowTo: "עד תאריך",
+  window2: "חלון נוסף (רשות)",
+  targetDate: "תאריך יעד (רשות)",
+  flexibility: "גמישות הלקוח",
+  flexibilityOptions: { HIGH: "גמיש", MEDIUM: "בינוני", LOW: "קשיח" } as Record<string, string>,
+  submit: "שלח בקשה",
+  resubmit: "שלח מחדש",
+  missingTitle: "הבקשה נשמרה, אבל חסרים פרטים",
+  missingBody: "היא לא תיכנס לשיבוץ עד שיושלמו:",
+  submittedTitle: "הבקשה נשלחה לשיבוץ",
+  flaggedTitle: "הבקשה נשמרה וממתינה לאישור זכאות",
+  flaggedBody: "ללקוח אין זכאות פנויה — הרכזת תקבל את זה לטיפול",
+  editTitle: "השלמת פרטי בקשה",
+};
+
+export const detail = {
+  timeline: "ציר זמן",
+  owner: "באחריות",
+  action: "הפעולה הבאה",
+  due: "דדליין",
+  escalate: "הסלמה",
+  eligibility: "זכאות",
+  eligibilityLabels: {
+    ELIGIBLE: "זכאי",
+    NOT_ELIGIBLE: "אין זכאות",
+    NEEDS_CHECK: "בבדיקה",
+    EXCEPTION_GRANTED: "חריגה אושרה",
+  } as Record<string, string>,
+  backToConsole: "חזרה למסך הראשי",
+};
+
 /** One Hebrew line per incident — rendered directly in the exceptions console. */
 export function incidentSummary(
   kind: IncidentKind,
   ctx: { supplierName?: string | null; shootDate?: string | null; region?: string | null; clientName?: string | null },
 ): string {
-  const day = [ctx.supplierName, ctx.shootDate ? shortDate(ctx.shootDate) : null, ctx.region]
+  const day = [ctx.supplierName, ctx.shootDate ? shortDate(ctx.shootDate) : null, regionLabel(ctx.region)]
     .filter(Boolean)
     .join(", ");
   switch (kind) {
