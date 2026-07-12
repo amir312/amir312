@@ -290,7 +290,12 @@ const cases: Case[] = [
     },
     effects: (effects) => {
       expect(effects).toContainEqual({ type: "SET_DAY_STATUS", dayId: IDS.day, status: "PARTIALLY_CONFIRMED" });
-      expect(effects).toContainEqual({ type: "CONFIRM_SLOT", dayId: IDS.day, shootDate: SHOOT_DATE });
+      expect(effects).toContainEqual({
+        type: "CONFIRM_SLOT",
+        dayId: IDS.day,
+        shootDate: SHOOT_DATE,
+        confirmedBy: "CLIENT",
+      });
       expect(effects).toContainEqual({ type: "SUPERSEDE_PROPOSALS" });
     },
   },

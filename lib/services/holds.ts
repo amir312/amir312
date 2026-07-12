@@ -114,6 +114,7 @@ export async function executeBookingEffects(
   tx: Tx,
   requestId: string,
   deferred: Effect[],
+  at: Date,
 ): Promise<Effect[]> {
   const remaining: Effect[] = [];
   for (const effect of deferred) {
@@ -160,9 +161,55 @@ export async function executeBookingEffects(
         }
         break;
       }
-      case "CONFIRM_SLOT":
+      case "CONFIRM_SLOT": {
+        // The winning proposal was marked CHOSEN by the caller before the
+        // transition — it defines the confirmed window.
+        const [chosen] = await tx
+          .select()
+          .from(slotProposals)
+          .where(
+            and(
+              eq(slotProposals.shootRequestId, requestId),
+              eq(slotProposals.status, "CHOSEN"),
+              eq(slotProposals.pairedDayId, effect.dayId),
+            ),
+          );
+        if (!chosen) throw new Error(`CONFIRM_SLOT: no chosen proposal for request ${requestId}`);
+        const [request] = await tx
+          .select({ clientId: shootRequests.clientId })
+          .from(shootRequests)
+          .where(eq(shootRequests.id, requestId));
+        const [slot] = await tx
+          .insert(shootSlots)
+          .values({
+            supplierDayId: effect.dayId,
+            shootRequestId: requestId,
+            clientId: request.clientId,
+            startTime: chosen.startTime,
+            endTime: chosen.endTime,
+            confirmedAt: at,
+            confirmedBy: effect.confirmedBy,
+          })
+          .returning({ id: shootSlots.id });
+        await tx
+          .update(shootRequests)
+          .set({ slotId: slot.id })
+          .where(eq(shootRequests.id, requestId));
+        // The confirmed window leaves the pool for good.
+        await tx
+          .update(supplierAvailability)
+          .set({ status: "CONFIRMED", heldUntil: null, heldForDayId: effect.dayId })
+          .where(
+            and(
+              eq(supplierAvailability.supplierId, chosen.supplierId),
+              eq(supplierAvailability.date, chosen.date),
+              eq(supplierAvailability.startTime, chosen.startTime),
+            ),
+          );
+        break;
+      }
       case "REMATCH_HALF":
-        // Phase 3 — the matcher and slot creation land there.
+        // Runs AFTER commit (the matcher re-run) — hand it back to the caller.
         remaining.push(effect);
         break;
       default:
@@ -190,6 +237,8 @@ export async function expireHold(
 ) {
   const dayId = await heldDayIdFor(tx, requestId);
   if (!dayId) throw new Error(`request ${requestId} has no held day to release`);
+  // DAY → REQUEST lock order, matching chooseDate/declineDate/approveMatch.
+  await tx.select().from(supplierDays).where(eq(supplierDays.id, dayId)).for("update");
 
   if (!opts.force) {
     // Guard on the REQUEST'S OWN window only: an unrelated live hold on the
@@ -234,19 +283,27 @@ export async function expireHold(
     .set({ status: "EXPIRED" })
     .where(and(eq(slotProposals.shootRequestId, requestId), eq(slotProposals.status, "SENT")));
 
-  const remaining = await executeBookingEffects(tx, requestId, outcome.deferred);
+  const remaining = await executeBookingEffects(tx, requestId, outcome.deferred, at);
   assertOnlyRematchDeferred(remaining, "expireHold");
 
   // The confirmed partner (if any) hears about it on their own timeline —
-  // their spine is untouched, by the paired-confirmation rule.
+  // their spine is untouched, by the paired-confirmation rule. A concurrent
+  // partner move must not fail the release (savepoint + skip).
   if (pairing.partnerStatus === "CONFIRMED" && pairing.partnerRequestId) {
-    await applyTransition(tx, pairing.partnerRequestId, {
-      kind: "PAIR_PARTNER_DECLINED",
-      at,
-      actor: { type: "SYSTEM" },
-      partnerRequestId: requestId,
-      cause: "HOLD_EXPIRED",
-    });
+    const partnerId = pairing.partnerRequestId;
+    try {
+      await tx.transaction(async (inner) => {
+        await applyTransition(inner, partnerId, {
+          kind: "PAIR_PARTNER_DECLINED",
+          at,
+          actor: { type: "SYSTEM" },
+          partnerRequestId: requestId,
+          cause: "HOLD_EXPIRED",
+        });
+      });
+    } catch {
+      /* timeline fact only */
+    }
   }
   return outcome;
 }
@@ -311,7 +368,7 @@ export async function placeHold(
  */
 export async function releaseExpiredHolds(
   now = new Date(),
-): Promise<{ releasedRequests: string[] }> {
+): Promise<{ releasedRequests: string[]; rematchDayIds: string[] }> {
   const expired = await db()
     .selectDistinct({ dayId: supplierAvailability.heldForDayId })
     .from(supplierAvailability)
@@ -324,6 +381,7 @@ export async function releaseExpiredHolds(
     );
 
   const releasedRequests: string[] = [];
+  const rematchDays = new Set<string>();
   const skipped: Array<{ dayId: string; requestId?: string; reason: string }> = [];
 
   for (const { dayId } of expired) {
@@ -347,7 +405,10 @@ export async function releaseExpiredHolds(
           // transaction or the rest of the run.
           try {
             await tx.transaction(async (inner) => {
-              await expireHold(inner, w.requestId, now, { type: "SYSTEM" });
+              const outcome = await expireHold(inner, w.requestId, now, { type: "SYSTEM" });
+              for (const effect of outcome.deferred) {
+                if (effect.type === "REMATCH_HALF") rematchDays.add(effect.dayId);
+              }
             });
             releasedRequests.push(w.requestId);
           } catch (err) {
@@ -379,5 +440,7 @@ export async function releaseExpiredHolds(
   if (skipped.length > 0) {
     console.error("releaseExpiredHolds skipped:", JSON.stringify(skipped));
   }
-  return { releasedRequests };
+  // The matcher re-run on freed halves is the caller's post-commit step —
+  // holds.ts stays free of a circular dependency on the matching service.
+  return { releasedRequests, rematchDayIds: [...rematchDays] };
 }

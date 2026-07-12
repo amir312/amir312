@@ -53,14 +53,14 @@ test("5/6 overdue deliverable → reminder to the photographer", async ({ page }
   await expect(page.getByText("בוצע").first()).toBeVisible();
 });
 
-test("6/6 stuck proposal → approving updates the row to the next step", async ({ page }) => {
+test("6/6 stuck proposal → approving runs the FULL flow: hold placed, date link out, card gone", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByText("הצעת שיבוץ ממתינה לאישורך").first()).toBeVisible();
   await clickAndSettle(page, "אשר את השיבוץ");
   await expect(page.getByText("הצעת שיבוץ ממתינה לאישורך")).toHaveCount(0);
-  // honest state: the hold-placement automation lands in phase 3, so the
-  // request now shows as a stalled SYSTEM step — visible, not hidden
-  await expect(page.getByText("המערכת נתקעה בשמירת היום").first()).toBeVisible();
+  // The request moved on: the whole day is soft-held and the client now owes
+  // a date choice — with fresh deadlines it leaves the exceptions console.
+  await expect(page.getByText("המערכת נתקעה בשמירת היום")).toHaveCount(0);
 });
 
 test("bonus: eligibility hold → granting the exception clears it", async ({ page }) => {

@@ -23,9 +23,10 @@ import { createDb, type Db } from "./client";
 import { migrate } from "./migrate";
 import * as s from "./schema";
 import { applyTransition, loadRules } from "@/lib/workflow/apply";
+import { rematchFreeHalf } from "@/lib/services/matching";
 import { RULE } from "@/lib/workflow/rules";
-import { executeBookingEffects } from "@/lib/services/holds";
-import type { PairingContext, WorkflowEvent } from "@/lib/workflow/types";
+import { assertOnlyRematchDeferred, executeBookingEffects } from "@/lib/services/holds";
+import type { Actor, BriefOwner, PairingContext, WorkflowEvent } from "@/lib/workflow/types";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ?? "postgres://postgres:postgres@127.0.0.1:5432/shootops_dev";
@@ -198,46 +199,42 @@ async function seed(db: Db): Promise<void> {
     return row;
   }
 
-  /** Materialize a confirmed slot (what CONFIRM_SLOT will do in phase 3). */
-  async function confirmSlot(
-    requestId: string,
-    clientId: string,
-    dayId: string,
-    startTime: string,
-    endTime: string,
-    confirmedAt: Date,
-    confirmedBy: string,
-  ) {
-    // One transaction — a half-materialized booking must be impossible.
-    // Keep reconciled with the phase-3 CONFIRM_SLOT executor.
-    return db.transaction(async (tx) => {
-      const [slot] = await tx
-        .insert(s.shootSlots)
-        .values({
-          supplierDayId: dayId,
-          shootRequestId: requestId,
-          clientId,
-          startTime,
-          endTime,
-          confirmedAt,
-          confirmedBy,
-        })
-        .returning();
-      await tx.update(s.shootRequests).set({ slotId: slot.id }).where(eq(s.shootRequests.id, requestId));
+  /**
+   * Confirm through the REAL production path — proposal → CHOSEN, then the
+   * CLIENT_CONFIRMED transition, then the CONFIRM_SLOT executor, one
+   * transaction. Demo and production share one code path on purpose.
+   */
+  async function confirm(opts: {
+    requestId: string;
+    at: Date;
+    actor: Actor;
+    confirmedBy: "CLIENT" | "SOCIAL_MANAGER" | "COORDINATOR";
+    briefOwner: BriefOwner;
+    supplierId: string;
+    pairing: PairingContext;
+  }) {
+    await db.transaction(async (tx) => {
+      // CHOSEN first so the CONFIRM_SLOT executor can find the winning window.
       await tx
         .update(s.slotProposals)
         .set({ status: "CHOSEN" })
-        .where(and(eq(s.slotProposals.shootRequestId, requestId), eq(s.slotProposals.status, "SENT")));
-      await tx
-        .update(s.supplierAvailability)
-        .set({ status: "CONFIRMED", heldUntil: null })
         .where(
-          and(
-            eq(s.supplierAvailability.heldForDayId, dayId),
-            eq(s.supplierAvailability.startTime, startTime),
-          ),
+          and(eq(s.slotProposals.shootRequestId, opts.requestId), eq(s.slotProposals.status, "SENT")),
         );
-      return slot;
+      const outcome = await applyTransition(tx, opts.requestId, {
+        kind: "CLIENT_CONFIRMED",
+        at: opts.at,
+        actor: opts.actor,
+        shootDate: opts.pairing.shootDate,
+        confirmedBy: opts.confirmedBy,
+        pairing: opts.pairing,
+        briefOwner: opts.briefOwner,
+        supplierId: opts.supplierId,
+      });
+      assertOnlyRematchDeferred(
+        await executeBookingEffects(tx, opts.requestId, outcome.deferred, opts.at),
+        "seed confirm",
+      );
     });
   }
 
@@ -316,11 +313,10 @@ async function seed(db: Db): Promise<void> {
     }
 
     // A confirms (partner still deciding)
-    await fire(rA.id, {
-      kind: "CLIENT_CONFIRMED",
+    await confirm({
+      requestId: rA.id,
       at: h(20),
       actor: asSm(maya.id),
-      shootDate: date,
       confirmedBy: "SOCIAL_MANAGER",
       briefOwner: { type: "SOCIAL_MANAGER", id: maya.id },
       supplierId: dani.id,
@@ -335,7 +331,6 @@ async function seed(db: Db): Promise<void> {
         partnerStatus: "PENDING",
       },
     });
-    await confirmSlot(rA.id, bakery.id, day.id, "08:00", "12:00", h(20), "SOCIAL_MANAGER");
     await fire(rB.id, { kind: "PAIR_PARTNER_CONFIRMED", at: h(20), actor: system, partnerRequestId: rA.id });
 
     // B declines — THE paired-confirmation rule fires (incident, day PARTIALLY_CONFIRMED).
@@ -361,9 +356,41 @@ async function seed(db: Db): Promise<void> {
         .update(s.slotProposals)
         .set({ status: "DECLINED" })
         .where(and(eq(s.slotProposals.shootRequestId, rB.id), eq(s.slotProposals.status, "SENT")));
-      await executeBookingEffects(tx, rB.id, declined.deferred);
+      assertOnlyRematchDeferred(
+        await executeBookingEffects(tx, rB.id, declined.deferred, h(18)),
+        "seed decline",
+      );
     });
     await fire(rA.id, { kind: "PAIR_PARTNER_DECLINED", at: h(18), actor: system, partnerRequestId: rB.id, cause: "DECLINED" });
+
+    // A replacement candidate waits in the same region — the rematch attaches
+    // it to Noam's half-day incident (this is the phase-3 demo payload).
+    const [marzipan] = await db
+      .insert(s.clients)
+      .values({
+        name: "קונדיטוריית מרציפן",
+        regionCode: "SHARON",
+        lat: 32.183,
+        lng: 34.871,
+        contactPhone: "050-4000009",
+        isSocialManaged: true,
+        socialManagerId: maya.id,
+      })
+      .returning();
+    await db.insert(s.entitlementEvents).values({
+      clientId: marzipan.id,
+      kind: "GRANT",
+      shootType: "STILLS",
+      delta: 1,
+      source: "LEGACY_PACKAGE",
+    });
+    const candidate = await newRequest(marzipan, maya.id, {
+      purpose: "צילומי קינוחים לתפריט החורף",
+      clientWindows: [{ from: ilDate(1), to: ilDate(21) }],
+    });
+    ids.pendingCandidate = candidate.id;
+    await fire(candidate.id, { kind: "REQUEST_SUBMITTED", at: h(30), actor: asSm(maya.id), submitterId: maya.id });
+    await rematchFreeHalf(day.id);
 
     // A continues to the brief, on time
     await fire(rA.id, {
@@ -382,24 +409,21 @@ async function seed(db: Db): Promise<void> {
     const r = await newRequest(restaurant, yuval.id, { shootType: "VIDEO", purpose: "סרטון תדמית למסעדה + צילומי מנות" });
     ids.lateBrief = r.id;
     const day = await mkDay(michal.id, date, "TLV");
-    await mkAvail(michal.id, date, "09:00", "13:00", { status: "CONFIRMED", heldForDayId: day.id });
+    await mkAvail(michal.id, date, "09:00", "13:00");
     await mkProposal(r.id, michal.id, day.id, date, "09:00", "13:00", "מיכל מתמחה בווידאו ופנויה בתאריך המבוקש");
     await fire(r.id, { kind: "REQUEST_SUBMITTED", at: d(4), actor: asSm(yuval.id), submitterId: yuval.id });
     await fire(r.id, { kind: "MATCH_PROPOSED", at: d(4), actor: system, paired: false, proposalCount: 1 });
     await fire(r.id, { kind: "COORDINATOR_APPROVED_MATCH", at: d(3), actor: { type: "COORDINATOR", id: noam.id }, dayId: day.id });
     await fire(r.id, { kind: "HOLD_PLACED", at: d(3), actor: system, dayId: day.id, heldUntil: d(1), chooser: { type: "SOCIAL_MANAGER", id: yuval.id } });
-    await fire(r.id, {
-      kind: "CLIENT_CONFIRMED",
+    await confirm({
+      requestId: r.id,
       at: d(3),
       actor: asSm(yuval.id),
-      shootDate: date,
       confirmedBy: "SOCIAL_MANAGER",
       briefOwner: { type: "SOCIAL_MANAGER", id: yuval.id },
       supplierId: michal.id,
       pairing: soloPairing(day, "TLV", michal.id),
     });
-    await confirmSlot(r.id, restaurant.id, day.id, "09:00", "13:00", d(3), "SOCIAL_MANAGER");
-    await db.update(s.supplierDays).set({ status: "CONFIRMED" }).where(eq(s.supplierDays.id, day.id));
     await fire(r.id, {
       kind: "BRIEF_STARTED",
       at: d(3),
@@ -416,24 +440,21 @@ async function seed(db: Db): Promise<void> {
     const r = await newRequest(clinic, yuval.id, { shootType: "VIDEO", purpose: "סרטוני הסברה למטופלים" });
     ids.t1Missed = r.id;
     const day = await mkDay(michal.id, date, "TLV");
-    await mkAvail(michal.id, date, "09:00", "13:00", { status: "CONFIRMED", heldForDayId: day.id });
+    await mkAvail(michal.id, date, "09:00", "13:00");
     await mkProposal(r.id, michal.id, day.id, date, "09:00", "13:00", "מיכל פנויה מחר בבוקר באזור תל אביב");
     await fire(r.id, { kind: "REQUEST_SUBMITTED", at: d(5), actor: asSm(yuval.id), submitterId: yuval.id });
     await fire(r.id, { kind: "MATCH_PROPOSED", at: d(5), actor: system, paired: false, proposalCount: 1 });
     await fire(r.id, { kind: "COORDINATOR_APPROVED_MATCH", at: d(5), actor: { type: "COORDINATOR", id: noam.id }, dayId: day.id });
     await fire(r.id, { kind: "HOLD_PLACED", at: d(5), actor: system, dayId: day.id, heldUntil: d(3), chooser: { type: "SOCIAL_MANAGER", id: yuval.id } });
-    await fire(r.id, {
-      kind: "CLIENT_CONFIRMED",
+    await confirm({
+      requestId: r.id,
       at: d(4),
       actor: asSm(yuval.id),
-      shootDate: date,
       confirmedBy: "SOCIAL_MANAGER",
       briefOwner: { type: "SOCIAL_MANAGER", id: yuval.id },
       supplierId: michal.id,
       pairing: soloPairing(day, "TLV", michal.id),
     });
-    await confirmSlot(r.id, clinic.id, day.id, "09:00", "13:00", d(4), "SOCIAL_MANAGER");
-    await db.update(s.supplierDays).set({ status: "CONFIRMED" }).where(eq(s.supplierDays.id, day.id));
     await fire(r.id, { kind: "BRIEF_STARTED", at: d(4), actor: asSm(yuval.id), shootDate: date, briefOwner: { type: "SOCIAL_MANAGER", id: yuval.id } });
     await fire(r.id, { kind: "BRIEF_SENT_TO_CLIENT", at: d(3), actor: asSm(yuval.id), approver: { type: "CLIENT", id: clinic.id } });
     await fire(r.id, { kind: "BRIEF_APPROVED", at: d(2), actor: asClient(clinic.id) });
@@ -453,24 +474,21 @@ async function seed(db: Db): Promise<void> {
     const r = await newRequest(salon, maya.id, { purpose: "צילומי עיצובי שיער ללקוחות" });
     ids.overdueDeliverable = r.id;
     const day = await mkDay(roni.id, date, "SHARON");
-    await mkAvail(roni.id, date, "10:00", "14:00", { status: "CONFIRMED", heldForDayId: day.id });
+    await mkAvail(roni.id, date, "10:00", "14:00");
     await mkProposal(r.id, roni.id, day.id, date, "10:00", "14:00", "רוני קבועה של המספרה");
     await fire(r.id, { kind: "REQUEST_SUBMITTED", at: d(14), actor: asSm(maya.id), submitterId: maya.id });
     await fire(r.id, { kind: "MATCH_PROPOSED", at: d(14), actor: system, paired: false, proposalCount: 1 });
     await fire(r.id, { kind: "COORDINATOR_APPROVED_MATCH", at: d(13), actor: { type: "COORDINATOR", id: noam.id }, dayId: day.id });
     await fire(r.id, { kind: "HOLD_PLACED", at: d(13), actor: system, dayId: day.id, heldUntil: d(11), chooser: { type: "SOCIAL_MANAGER", id: maya.id } });
-    await fire(r.id, {
-      kind: "CLIENT_CONFIRMED",
+    await confirm({
+      requestId: r.id,
       at: d(12),
       actor: asSm(maya.id),
-      shootDate: date,
       confirmedBy: "SOCIAL_MANAGER",
       briefOwner: { type: "SOCIAL_MANAGER", id: maya.id },
       supplierId: roni.id,
       pairing: soloPairing(day, "SHARON", roni.id),
     });
-    await confirmSlot(r.id, salon.id, day.id, "10:00", "14:00", d(12), "SOCIAL_MANAGER");
-    await db.update(s.supplierDays).set({ status: "CONFIRMED" }).where(eq(s.supplierDays.id, day.id));
     await fire(r.id, { kind: "BRIEF_STARTED", at: d(12), actor: asSm(maya.id), shootDate: date, briefOwner: { type: "SOCIAL_MANAGER", id: maya.id } });
     await fire(r.id, { kind: "BRIEF_SENT_TO_CLIENT", at: d(11), actor: asSm(maya.id), approver: { type: "CLIENT", id: salon.id } });
     await fire(r.id, { kind: "BRIEF_APPROVED", at: d(10), actor: asClient(salon.id) });
@@ -492,6 +510,7 @@ async function seed(db: Db): Promise<void> {
     const r = await newRequest(gelato, yuval.id, { purpose: "צילומי גלידות לקיץ" });
     ids.stuckProposal = r.id;
     const day = await mkDay(michal.id, ilDate(4), "TLV");
+    await mkAvail(michal.id, ilDate(4), "09:00", "13:00");
     await mkProposal(r.id, michal.id, day.id, ilDate(4), "09:00", "13:00", "מיכל פנויה; שקלי זיווג עם לקוח נוסף בתל אביב", { expiresAt: d(1) });
     await fire(r.id, { kind: "REQUEST_SUBMITTED", at: h(74), actor: asSm(yuval.id), submitterId: yuval.id });
     await fire(r.id, { kind: "MATCH_PROPOSED", at: h(72), actor: system, paired: false, proposalCount: 1 });
@@ -510,24 +529,21 @@ async function seed(db: Db): Promise<void> {
     const r = await newRequest(bikes, noam.id, { purpose: "צילומי חנות ושירות", needsBrief: false });
     ids.todayShoot = r.id;
     const day = await mkDay(dani.id, date, "SHARON");
-    await mkAvail(dani.id, date, "08:00", "12:00", { status: "CONFIRMED", heldForDayId: day.id });
+    await mkAvail(dani.id, date, "08:00", "12:00");
     await mkProposal(r.id, dani.id, day.id, date, "08:00", "12:00", "דני זמין הבוקר");
     await fire(r.id, { kind: "REQUEST_SUBMITTED", at: d(6), actor: system, submitterId: noam.id });
     await fire(r.id, { kind: "MATCH_PROPOSED", at: d(6), actor: system, paired: false, proposalCount: 1 });
     await fire(r.id, { kind: "COORDINATOR_APPROVED_MATCH", at: d(6), actor: { type: "COORDINATOR", id: noam.id }, dayId: day.id });
     await fire(r.id, { kind: "HOLD_PLACED", at: d(6), actor: system, dayId: day.id, heldUntil: d(4), chooser: { type: "CLIENT", id: bikes.id } });
-    await fire(r.id, {
-      kind: "CLIENT_CONFIRMED",
+    await confirm({
+      requestId: r.id,
       at: d(5),
       actor: asClient(bikes.id),
-      shootDate: date,
       confirmedBy: "CLIENT",
       briefOwner: { type: "COORDINATOR", id: noam.id },
       supplierId: dani.id,
       pairing: soloPairing(day, "SHARON", dani.id),
     });
-    await confirmSlot(r.id, bikes.id, day.id, "08:00", "12:00", d(5), "CLIENT");
-    await db.update(s.supplierDays).set({ status: "CONFIRMED" }).where(eq(s.supplierDays.id, day.id));
     await fire(r.id, { kind: "T1_CONFIRMED", at: d(1), actor: asSupplier(dani.id), supplierId: dani.id, shootDate: date });
     await db
       .update(s.shootSlots)

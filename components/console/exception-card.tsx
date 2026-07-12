@@ -7,6 +7,7 @@ import {
   ownerLabels,
   severityLabels,
   suggestionLabels,
+  proposalsT,
   shootTypeLabels,
 } from "@/lib/i18n/he";
 import type { ExceptionItem } from "@/lib/services/console";
@@ -24,7 +25,21 @@ const SEVERITY_BADGE: Record<ExceptionItem["severity"], "escalated" | "overdue" 
   AT_RISK: "secondary",
 };
 
+interface ReplacementCandidate {
+  requestId: string;
+  clientName: string;
+  score?: number;
+  reason?: string;
+}
+
+function candidatesOf(item: ExceptionItem): ReplacementCandidate[] {
+  const res = item.proposedResolution as { candidates?: ReplacementCandidate[] } | null;
+  if (!res?.candidates || !Array.isArray(res.candidates)) return [];
+  return res.candidates.filter((c) => c.requestId && c.clientName);
+}
+
 export function ExceptionCard({ item }: { item: ExceptionItem }) {
+  const candidates = candidatesOf(item);
   const headline = item.incidentSummary ?? exceptionHeadline(item.status, item.action);
   const labels = suggestionLabels[item.suggestion.key];
   const who = item.ownerType
@@ -64,6 +79,27 @@ export function ExceptionCard({ item }: { item: ExceptionItem }) {
       </div>
 
       {labels.explain ? <p className="text-sm text-muted-foreground">{labels.explain}</p> : null}
+
+      {candidates.length > 0 ? (
+        <div className="rounded-lg bg-accent/50 p-2.5">
+          <div className="mb-1 text-xs font-semibold text-muted-foreground">
+            {proposalsT.candidates}
+          </div>
+          <ul className="flex flex-col gap-1">
+            {candidates.map((c) => (
+              <li key={c.requestId} className="flex items-center justify-between gap-2 text-sm">
+                <Link
+                  href={`/requests/${c.requestId}`}
+                  className="font-medium underline-offset-4 hover:underline"
+                >
+                  {c.clientName}
+                </Link>
+                <span className="text-xs text-muted-foreground">{c.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       <div className="flex items-center gap-3 pt-1">
         {item.suggestion.kind === "navigate" ? (

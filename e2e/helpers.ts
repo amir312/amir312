@@ -23,3 +23,15 @@ export function issueAvailabilityToken(): string {
     .split("\n")
     .pop()!;
 }
+
+/** Issue a fresh CHOOSE_DATE token for a seeded SOFT_HELD request. */
+export function issueChooseDateToken(): string {
+  return execSync("pnpm exec tsx db/dev-token.ts choose", {
+    env: { ...process.env, DATABASE_URL },
+    timeout: 60_000,
+  })
+    .toString()
+    .trim()
+    .split("\n")
+    .pop()!;
+}

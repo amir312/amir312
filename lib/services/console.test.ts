@@ -7,7 +7,7 @@
  *  - notifications: same-window duplicate suppressed, FAILED sends retriable,
  *    timeline entry recorded atomically with the notification row.
  */
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import * as s from "@/db/schema";
 import {
@@ -147,6 +147,52 @@ describe("expireHold guard", () => {
       .from(s.supplierAvailability)
       .where(eq(s.supplierAvailability.heldForDayId, day.id));
     expect(avail).toHaveLength(0); // released back to the open pool
+  });
+});
+
+describe("REMIND_CLIENT_DATE", () => {
+  it("delivers a WORKING fresh link (not a linkless nudge); same window → duplicate, link untouched", async () => {
+    const { req } = await seedSoftHeldException(new Date(Date.now() + 30 * HOUR), "2026-09-20");
+    const coordinator = await seedUser(t.db, { role: "COORDINATOR", name: "נועם" });
+    const ref = { requestId: req.id, incidentId: null, note: null };
+
+    const first = await consoleSvc.executeSuggestion(coordinator, "REMIND_CLIENT_DATE", ref);
+    expect(first.ok).toBe(true);
+    expect(first).not.toHaveProperty("message", "DUPLICATE");
+
+    // A live one-shot CHOOSE_DATE token now exists for this request…
+    const liveTokens = async () =>
+      (
+        await t.db
+          .select()
+          .from(s.accessTokens)
+          .where(
+            and(eq(s.accessTokens.entityId, req.id), eq(s.accessTokens.purpose, "CHOOSE_DATE")),
+          )
+      ).filter((tok) => tok.revokedAt === null && tok.usedAt === null);
+    const live = await liveTokens();
+    expect(live).toHaveLength(1);
+
+    // …and the outgoing message references THAT token (raw link never stored).
+    const notes = await t.db
+      .select()
+      .from(s.notifications)
+      .where(eq(s.notifications.entityId, req.id));
+    const reminder = notes.find((n) => JSON.stringify(n.payload).includes(`[link:${live[0].id}]`));
+    expect(reminder).toBeDefined();
+    expect(reminder!.template).toBe("client_date_options");
+    expect(JSON.stringify(reminder!.payload)).not.toMatch(/\/c\/[A-Za-z0-9_-]{20,}/);
+
+    // The timeline shows the reminder.
+    const evts = await t.db.select().from(s.events).where(eq(s.events.entityId, req.id));
+    expect(evts.map((e) => e.kind)).toContain("MESSAGE_SENT");
+
+    // Double-click inside the reminder window: suppressed, live link NOT revoked.
+    const second = await consoleSvc.executeSuggestion(coordinator, "REMIND_CLIENT_DATE", ref);
+    expect(second).toMatchObject({ ok: true, message: "DUPLICATE" });
+    const liveAfter = await liveTokens();
+    expect(liveAfter).toHaveLength(1);
+    expect(liveAfter[0].id).toBe(live[0].id);
   });
 });
 

@@ -53,8 +53,7 @@ const byStatusAction: Partial<Record<RequestStatus, Partial<Record<NextAction, S
   },
   PENDING_MATCH: {
     GRANT_EXCEPTION: { key: "GRANT_EXCEPTION", kind: "transition" },
-    // Becomes a real "run the matcher" transition in phase 3.
-    FIND_SUPPLIER: { key: "RUN_MATCHER", kind: "navigate" },
+    FIND_SUPPLIER: { key: "RUN_MATCHER", kind: "transition" },
   },
   OPTIONS_PROPOSED: {
     REVIEW_REQUEST: { key: "APPROVE_MATCH", kind: "transition" },

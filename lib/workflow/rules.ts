@@ -73,6 +73,8 @@ export const RULE = {
   deliverableEscalateGraceHours: "deliverable_escalate_grace_hours",
   tMinus1DeadlineHour: "t_minus_1_deadline_hour",
   maxPairingTravelMinutes: "max_pairing_travel_minutes",
+  urgencyHorizonDays: "urgency_horizon_days",
+  travelEstimateKmh: "travel_estimate_kmh",
   slotOptionsPerClient: "slot_options_per_client",
   shootDurationMinutes: "shoot_duration_minutes",
   staleRequestDays: "stale_request_days",

@@ -9,10 +9,11 @@ import { createAndSubmitRequest, updateAndResubmitRequest } from "@/lib/services
 import { executeSuggestion } from "@/lib/services/console";
 import { requestPrereqs } from "@/lib/validation/request";
 import { SUGGESTION_KEYS } from "@/lib/workflow/suggestions";
-import { availabilityT, console_, errors, suppliersT } from "@/lib/i18n/he";
+import { availabilityT, chooseT, console_, errors, shortDate, suppliersT } from "@/lib/i18n/he";
 import { supplierInput } from "@/lib/validation/supplier";
 import { createSupplier, updateSupplier } from "@/lib/services/suppliers";
 import { submitAvailability, verifyAvailabilityToken } from "@/lib/services/availability";
+import { chooseDate, declineDate } from "@/lib/services/matching";
 
 function str(v: FormDataEntryValue | null): string | undefined {
   const s = typeof v === "string" ? v.trim() : "";
@@ -210,4 +211,53 @@ export async function submitAvailabilityAction(
     parsed.data.note ?? null,
   );
   return { savedCount: saved };
+}
+
+export interface ChooseDateActionState {
+  outcome?: "CONFIRMED" | "DECLINED";
+  date?: string;
+  error?: string;
+}
+
+const chooseInput = z.object({
+  token: z.string().min(10),
+  proposalId: z.uuid().nullish(),
+  decline: z.string().nullish(),
+});
+
+export async function chooseDateAction(
+  _prev: ChooseDateActionState,
+  fd: FormData,
+): Promise<ChooseDateActionState> {
+  // No staff session — the one-shot token is the credential.
+  const parsed = chooseInput.safeParse({
+    token: str(fd.get("token")),
+    proposalId: str(fd.get("proposalId")) ?? null,
+    decline: str(fd.get("decline")) ?? null,
+  });
+  if (!parsed.success) return { error: errors.invalidAction };
+
+  const { token, proposalId, decline } = parsed.data;
+  let result: Awaited<ReturnType<typeof chooseDate>>;
+  try {
+    result = decline
+      ? await declineDate(token)
+      : proposalId
+        ? await chooseDate(token, proposalId)
+        : ({ ok: false, reason: "INVALID" } as const);
+  } catch (err) {
+    console.error("chooseDateAction failed:", err);
+    return { error: errors.actionFailed };
+  }
+
+  if (!result.ok) {
+    if (result.reason === "OPTION_GONE") return { error: chooseT.optionGone };
+    if (result.reason === "USED") return { error: chooseT.alreadyUsedTitle };
+    return { error: chooseT.invalidTitle };
+  }
+  revalidatePath("/");
+  if (result.outcome === "CONFIRMED") {
+    return { outcome: "CONFIRMED", date: shortDate(result.date) };
+  }
+  return { outcome: "DECLINED" };
 }

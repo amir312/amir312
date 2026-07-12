@@ -217,3 +217,76 @@ transitions.ts at 100/100 lines and branches).
    config change, not a deploy.
 3. `expireHold` refuses live holds by default (`force` opt-out) and notifies a confirmed
    partner via PAIR_PARTNER_DECLINED on their timeline.
+
+---
+
+## Phase 3 — Matcher + date-selection link ⭐
+
+**Built:**
+- `lib/matching/geo.ts` + `lib/matching/matcher.ts` — pure greedy matcher, no solver, no
+  PostGIS. Hard filters: capability · region · open windows · client date windows · travel ≤
+  `rules.max_pairing_travel_minutes` (haversine at `rules.travel_estimate_kmh`). Score =
+  40×paired + 25×urgency + 20×(1−normalized travel) + 15×client inflexibility. Every candidate
+  carries a Hebrew `reason` Noam can interrogate; pairing candidates are taken only when MUTUAL.
+- `lib/services/matching.ts` — the lifecycle: `proposeMatches` (idempotent while proposals are
+  live; day-capacity-aware — see P3-1), `approveMatch` (approves the DAY: every live proposal
+  on it together; whole-day soft hold via `placeHold`; alternates SUPERSEDED; parallel links
+  post-commit), `chooseDate`/`declineDate` (one-shot token → transition → booking effects in ONE
+  tx, partner notified tolerantly), `rematchFreeHalf` (refill candidates onto the open incident),
+  `getChoicePage` (a USED link shows the outcome, not a dead end — no-JS safe).
+- `/c/[token]` — the mobile client page (RTL, no account): the held date + "אף מועד לא מתאים",
+  confirmation/decline outcome screens.
+- Console wiring: `APPROVE_MATCH` executes the real approval, `RUN_MATCHER` proposes for one
+  request, `REMIND_CLIENT_DATE` re-mints and DELIVERS a working link (windowed, atomic timeline
+  record). Unknown service errors surface as Hebrew, never a 500.
+- Jobs: `run-matcher` (*/15), and hold releases now feed `rematchFreeHalf` per freed day.
+- Seed grew the phase-3 story: a pending replacement candidate attached to the half-day incident,
+  and a SOFT_HELD day with a live date link (`tsx db/dev-token.ts choose` mints an e2e/demo token).
+
+**Acceptance criterion — THE scenario (executed in `lib/services/matching.test.ts`, real Postgres):**
+
+| criterion | result |
+| --- | --- |
+| 2 clients → one PAIRED proposal on one supplier day, Hebrew reasons name the partner | **PASS** |
+| Noam approves once → WHOLE day soft-held, both links go out in parallel, raw token never stored | **PASS** |
+| A confirms → slot materialized in-tx, day PARTIALLY_CONFIRMED, B's spine untouched, token replay refused | **PASS** |
+| B declines → **A stays CONFIRMED — all six spine fields byte-identical** (owner, action, due, escalate, since) | **PASS** |
+| B's half releases to AVAILABLE; B returns to PENDING_MATCH | **PASS** |
+| Incident for Noam carries replacement candidates by name; **the decliner is excluded** | **PASS** |
+| Hold-expiry variant (B never answers) → same protected outcome | **PASS** |
+| Zero confirmations (both decline via the service) → whole day releases, day CANCELLED, no stale incident | **PASS** |
+| `accepts_solo_half_day = false` + one confirm → SOLO_DAY_DECISION with the two prepared options **and** refill candidates; nothing auto-decided | **PASS** |
+| Day capacity: 4 candidates on a 2-window day → exactly 2 SENT proposals; a forced third is REFUSED at approval and rolls back | **PASS** |
+| `pnpm typecheck` / `lint` / `test` / `build` | **PASS** ×4 — 131 tests, transitions.ts at enforced 100% |
+| e2e (desktop + 390px) | **PASS** — 25, incl. choose-date flow + revisit-shows-outcome + screenshots |
+
+**Reviewer findings and fixes** (fresh-context subagent, verdict FIX-FIRST; all fixed and re-verified):
+
+| # | severity | finding | resolution |
+| --- | --- | --- | --- |
+| P3-1 | BLOCKER | greedy matcher overbooked a supplier day: 4 pending requests → 4 SENT proposals on a 2-window day; the collision surfaced as a client-facing 500 at confirm time (`slots_no_overlap`) | capacity map in the greedy pass (pair consumes 2, solo 1) **minus windows already promised to live SENT proposals** (our own regression test caught that gap: without it a pair assigned to a full day was proposed NOWHERE); in-tx persistence re-derives free windows (AVAILABLE − promised) and bails if the day filled meanwhile; `approveMatch` defense-in-depth refuses `requests > holdable` (`errors.dayOverbooked`); regression test proves 2-of-4 + refusal + rollback |
+| P3-2 | MAJOR | concurrent A-confirms/B-declines: the loser's PAIR_PARTNER_* notify threw TransitionError and 500'd a LEGITIMATE client confirmation | single lock order everywhere (DAY `FOR UPDATE` → REQUEST) so same-day actions serialize; partner notifies run in savepoints and are swallowed (they are timeline facts, not bookings); status guards return a friendly OPTION_GONE; the server action catches service errors → Hebrew message |
+| P3-3 | MAJOR | idempotency key `choose:{request}:{day}` silently swallowed links on re-approval after expiry, and REMIND_CLIENT_DATE sent a nudge with NO link | keys carry the token id (only exact retries suppressed); `sendChooseDateLink` revokes prior live links, with the duplicate check BEFORE revocation so a double-click can't kill the live link; `resendChooseDateLink` derives `held_until` from the live hold; console reminder delivers the real link with a windowed key + atomic MESSAGE_SENT record — tested (fresh link; duplicate leaves it untouched) |
+| P3-4 | MAJOR | `rematchFreeHalf` structurally returned ZERO candidates for `accepts_solo_half_day=false` suppliers — exactly the day that most needs refilling | refilling is a PAIRING question: candidates qualify by capability, region, own windows, and travel vs. THE CONFIRMED PARTNER's location, ignoring `accepts_solo_half_day`; anchor falls back to the day's region when coordinates are missing; tested on a SOLO_DAY_DECISION day |
+| P3-5 | MAJOR | the decliner qualified as a "replacement candidate" for the very half it vacated | requests with DECLINED/EXPIRED proposals on the day are excluded; asserted in THE scenario (B is pending, in-region, window-compatible — and absent) |
+| P3-6 | MINOR | client link shows ONE option; spec reads `rules.slot_options_per_client` options | recorded deviation — decision 1 below |
+| P3-7 | MINOR | travel speed hardcoded (50 km/h) in geo math | `rules.travel_estimate_kmh`, threaded matcher + refill |
+| P3-8 | MINOR | seed hand-materialized the confirmed slot instead of exercising the real executor | seed `confirm()` now runs proposal→CHOSEN → `applyTransition` → `executeBookingEffects` in one tx — demo and production share one code path; manual day-status updates dropped (SET_DAY_STATUS does it) |
+| P3-9 | MINOR | `dev-token choose` picked a request nondeterministically and hardcoded a 24h TTL | oldest-first ordering; TTL from `rules.hold_duration_hours` (same fix applied to `resendChooseDateLink`'s fallback) |
+| P3-10 | NIT | slot `confirmed_at` stamped with `new Date()` instead of the event time; `confirmed_by` never recorded on the production path | `executeBookingEffects(tx, requestId, deferred, at)`; the CONFIRM_SLOT effect now carries `confirmedBy` from the event — both stamped truthfully everywhere (choose, expiry, seed) |
+
+**Decisions the spec did not dictate:**
+1. **(P3-6 deviation, recorded on purpose)** A client link offers exactly ONE concrete date —
+   the approved, held day — not `slot_options_per_client` alternatives. An option is only real
+   if it is held; holding N supplier days per client to decorate a link would multiply
+   soft-locked capacity and fight the whole-day pairing hold. `slot_options_per_client` today
+   caps the matcher's proposals per request and the refill-candidate list. If Noam wants true
+   multi-option links, that is a deliberate multi-day-hold design, not a loop over this one.
+2. Approval is DAY-scoped: approving one request approves every live proposal on that day —
+   a pairing is approved as a pairing, never half of one.
+3. Exactly one live choose-date link per request at any moment; re-approval and reminders
+   re-mint and revoke the predecessor (hash-only storage, one-shot, expiry = hold expiry).
+4. Refill candidates are attached to the OPEN incident (`proposedResolution.candidates` +
+   count in the summary) — information for Noam, never an auto-booking (invariant 1).
+5. A USED choose-date link renders the outcome ("המועד אושר" / declined) instead of an error —
+   the no-JS double-submit and the "what did I click?" reload both land somewhere honest.

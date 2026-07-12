@@ -31,6 +31,8 @@ insert into rules (key, value, description) values
   ('deliverable_escalate_grace_hours','48',      'Grace after deliverable due date before escalation'),
   ('t_minus_1_deadline_hour',         '18',      'Local hour (timezone rule) by which supplier must confirm client contact the day before'),
   ('max_pairing_travel_minutes',      '30',      'Two clients can share a supplier day if within this drive time'),
+  ('urgency_horizon_days',            '14',      'A request waiting this long reaches full urgency in the matcher score'),
+  ('travel_estimate_kmh',             '50',      'Average door-to-door speed used to convert distance into the pairing travel filter'),
   ('slot_options_per_client',         '3',       'How many date options to offer a client'),
   ('shoot_duration_minutes',          '240',     'A shoot slot is 4 hours'),
   ('stale_request_days',              '2',       'A request stuck with one owner this long shows as an exception'),

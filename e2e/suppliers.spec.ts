@@ -3,8 +3,8 @@
  * link (token-authenticated, no account).
  */
 import { test, expect } from "@playwright/test";
-import { availabilityT, regionLabels, shootTypeLabels, suppliersT } from "@/lib/i18n/he";
-import { issueAvailabilityToken, reseed } from "./helpers";
+import { availabilityT, chooseT, regionLabels, shootTypeLabels, suppliersT } from "@/lib/i18n/he";
+import { issueAvailabilityToken, issueChooseDateToken, reseed } from "./helpers";
 
 test.describe.configure({ mode: "serial" });
 
@@ -57,4 +57,18 @@ test("availability link: photographer marks windows and they persist", async ({ 
 test("a garbage token gets the friendly invalid-link screen", async ({ page }) => {
   await page.goto("/s/not-a-real-token");
   await expect(page.getByText(availabilityT.invalidTitle)).toBeVisible();
+});
+
+test("client date link: choose the offered window and get the confirmation screen", async ({ page }) => {
+  reseed();
+  const token = issueChooseDateToken();
+  await page.goto(`/c/${token}`);
+  await expect(page.getByRole("heading", { level: 1 })).toContainText("שלום");
+  await page.getByRole("button", { name: chooseT.choose }).first().click();
+  await expect(page.getByText(chooseT.confirmedTitle)).toBeVisible();
+
+  // Revisiting the used link shows the outcome, never a second choice.
+  await page.goto(`/c/${token}`);
+  await expect(page.getByText(chooseT.confirmedTitle)).toBeVisible();
+  await expect(page.getByRole("button", { name: chooseT.choose })).toHaveCount(0);
 });

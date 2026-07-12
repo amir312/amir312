@@ -4,7 +4,7 @@
  */
 import { test, expect } from "@playwright/test";
 import { console_, suppliersT } from "@/lib/i18n/he";
-import { issueAvailabilityToken, reseed } from "./helpers";
+import { issueAvailabilityToken, issueChooseDateToken, reseed } from "./helpers";
 
 test.beforeAll(() => {
   reseed();
@@ -62,4 +62,11 @@ test("availability link renders", async ({ page }, testInfo) => {
   await page.goto(`/s/${token}`);
   await expect(page.getByRole("heading", { level: 1 })).toContainText("שלום");
   await page.screenshot({ path: shotName(testInfo, "availability"), fullPage: true });
+});
+
+test("client date link renders", async ({ page }, testInfo) => {
+  const token = issueChooseDateToken();
+  await page.goto(`/c/${token}`);
+  await expect(page.getByRole("heading", { level: 1 })).toContainText("שלום");
+  await page.screenshot({ path: shotName(testInfo, "choose-date"), fullPage: true });
 });

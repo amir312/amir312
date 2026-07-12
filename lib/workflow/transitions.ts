@@ -218,9 +218,12 @@ function freeHalfOrDay(pairing: PairingContext): Effect[] {
 }
 
 /** Day-side consequences when THIS request confirms its slot. */
-function confirmDayEffects(pairing: PairingContext): Effect[] {
+function confirmDayEffects(
+  pairing: PairingContext,
+  confirmedBy: "CLIENT" | "SOCIAL_MANAGER" | "COORDINATOR",
+): Effect[] {
   const effects: Effect[] = [
-    { type: "CONFIRM_SLOT", dayId: pairing.dayId, shootDate: pairing.shootDate },
+    { type: "CONFIRM_SLOT", dayId: pairing.dayId, shootDate: pairing.shootDate, confirmedBy },
     { type: "SUPERSEDE_PROPOSALS" },
   ];
   if (!pairing.isPaired || pairing.partnerStatus === "NONE" || pairing.partnerStatus === "CONFIRMED") {
@@ -377,7 +380,11 @@ export function transition(
       const spine = request.needsBrief
         ? briefSpine(event.briefOwner, event.pairing.shootDate, at, rules)
         : t1Spine(event.supplierId, event.pairing.shootDate, at, rules);
-      return { status: "CONFIRMED", ...spine, effects: confirmDayEffects(event.pairing) };
+      return {
+        status: "CONFIRMED",
+        ...spine,
+        effects: confirmDayEffects(event.pairing, event.confirmedBy),
+      };
     }
 
     case "CLIENT_DECLINED":

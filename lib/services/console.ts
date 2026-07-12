@@ -29,6 +29,7 @@ import { RULE } from "@/lib/workflow/rules";
 import { suggestFor, type Suggestion, type SuggestionKey } from "@/lib/workflow/suggestions";
 import type { NextAction, OwnerType, RequestStatus } from "@/lib/workflow/types";
 import { assertOnlyRematchDeferred, executeBookingEffects, expireHold } from "./holds";
+import { approveMatch, rematchFreeHalf, resendChooseDateLink, runMatcherForRequest } from "./matching";
 
 export interface ExceptionItem {
   shootRequestId: string | null;
@@ -287,30 +288,27 @@ export async function executeSuggestion(
   try {
     switch (key) {
       case "RELEASE_EXPIRED_HOLD": {
-        await db().transaction(async (tx) => {
-          await expireHold(tx, mustRequest(ref), at, coordinator);
+        const outcome = await db().transaction(async (tx) => {
+          return expireHold(tx, mustRequest(ref), at, coordinator);
         });
+        for (const effect of outcome.deferred) {
+          if (effect.type === "REMATCH_HALF") await rematchFreeHalf(effect.dayId);
+        }
         return { ok: true };
       }
 
       case "APPROVE_MATCH": {
-        await db().transaction(async (tx) => {
-          const requestId = mustRequest(ref);
-          const [proposal] = await tx
-            .select({ dayId: slotProposals.pairedDayId })
-            .from(slotProposals)
-            .where(and(eq(slotProposals.shootRequestId, requestId), eq(slotProposals.status, "SENT")))
-            .limit(1);
-          if (!proposal?.dayId) throw new Error("no pending proposal to approve");
-          const outcome = await applyTransition(tx, requestId, {
-            kind: "COORDINATOR_APPROVED_MATCH",
-            at,
-            actor: coordinator,
-            dayId: proposal.dayId,
-          });
-          assertOnlyRematchDeferred(outcome.deferred, "APPROVE_MATCH");
-          // Phase 3 chains HOLD_PLACED + link sending here.
-        });
+        // Full phase-3 flow: approve BOTH halves of the day, soft-hold the
+        // whole day, and send the parallel date links.
+        await approveMatch(coordinator, mustRequest(ref), at);
+        return { ok: true };
+      }
+
+      case "RUN_MATCHER": {
+        const { proposed } = await runMatcherForRequest(mustRequest(ref), at);
+        if (proposed.length === 0) {
+          return { ok: false, error: errors.noMatchFound };
+        }
         return { ok: true };
       }
 
@@ -397,7 +395,10 @@ export async function executeSuggestion(
             at,
             actor: { type: "SYSTEM" },
           });
-          assertOnlyRematchDeferred(await executeBookingEffects(tx, requestId, closed.deferred), "FORWARD_NOW");
+          assertOnlyRematchDeferred(
+            await executeBookingEffects(tx, requestId, closed.deferred, at),
+            "FORWARD_NOW",
+          );
           await tx
             .update(deliverables)
             .set({ status: "CLOSED" })
@@ -418,10 +419,37 @@ export async function executeSuggestion(
         return { ok: true };
       }
 
+      case "REMIND_CLIENT_DATE": {
+        // A date reminder without a working link is useless: re-mint the
+        // one-shot token and deliver it (windowed against double-clicks).
+        const requestId = mustRequest(ref);
+        const rules = await loadRules(db());
+        const windowH = rules.int(RULE.reminderWindowHours);
+        const bucket = Math.floor(at.getTime() / (windowH * 3_600_000));
+        const { recipientName } = await reminderRecipient(key, requestId);
+        const result = await resendChooseDateLink(requestId, {
+          idempotencyKey: `rem:${key}:${requestId}:${bucket}`,
+          record: async (tx) => {
+            await tx.insert(events).values({
+              entityType: "shoot_request",
+              entityId: requestId,
+              kind: "MESSAGE_SENT",
+              actorType: "COORDINATOR",
+              actorId: user.id,
+              summary: timelineNotes.reminderSent(recipientName),
+              payload: { template: key },
+              createdAt: at,
+            });
+          },
+        });
+        if (result.status === "DUPLICATE") return { ok: true, message: "DUPLICATE" };
+        if (result.status === "FAILED") return { ok: false, error: errors.actionFailed };
+        return { ok: true };
+      }
+
       case "REMIND_SUBMITTER":
       case "REMIND_BRIEF_OWNER":
       case "REMIND_CLIENT_BRIEF":
-      case "REMIND_CLIENT_DATE":
       case "REMIND_SUPPLIER_DELIVERABLES": {
         return sendReminder(user, key, mustRequest(ref), at);
       }
@@ -432,14 +460,18 @@ export async function executeSuggestion(
         return resolveIncident(user, mustIncident(ref), ref.note ?? null, at);
       }
 
-      case "RUN_MATCHER":
       case "OPEN_REQUEST":
         return { ok: false, error: errors.invalidAction };
     }
     // A forged/stale key that slipped past validation must not fall through.
     return { ok: false, error: errors.invalidAction };
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    const msg = err instanceof Error ? err.message : String(err);
+    // Known Hebrew messages pass to the UI verbatim; anything else is logged
+    // and replaced — Noam never sees a raw stack or English driver error.
+    const known = Object.values(errors).includes(msg);
+    if (!known) console.error("executeSuggestion failed:", err);
+    return { ok: false, error: known ? msg : errors.actionFailed };
   }
 }
 

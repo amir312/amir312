@@ -8,6 +8,7 @@
  * the `rules` table.
  */
 import { releaseExpiredHolds } from "@/lib/services/holds";
+import { matchAllPending, rematchFreeHalf } from "@/lib/services/matching";
 import { sendWeeklyAvailabilityRequests } from "@/lib/services/availability";
 import { inngest } from "./client";
 
@@ -19,8 +20,9 @@ function appOrigin(): string {
 export const releaseExpiredHoldsFn = inngest.createFunction(
   { id: "release-expired-holds", triggers: [{ cron: "*/5 * * * *" }] },
   async () => {
-    const { releasedRequests } = await releaseExpiredHolds(new Date());
-    return { releasedRequests };
+    const { releasedRequests, rematchDayIds } = await releaseExpiredHolds(new Date());
+    for (const dayId of rematchDayIds) await rematchFreeHalf(dayId);
+    return { releasedRequests, rematchDayIds };
   },
 );
 
@@ -32,4 +34,13 @@ export const weeklyAvailabilityFn = inngest.createFunction(
   },
 );
 
-export const functions = [releaseExpiredHoldsFn, weeklyAvailabilityFn];
+/** Propose matches for everything pending. Every 15 minutes; idempotent. */
+export const runMatcherFn = inngest.createFunction(
+  { id: "run-matcher", triggers: [{ cron: "*/15 * * * *" }] },
+  async () => {
+    const { proposed } = await matchAllPending(new Date());
+    return { proposed: proposed.length };
+  },
+);
+
+export const functions = [releaseExpiredHoldsFn, weeklyAvailabilityFn, runMatcherFn];

@@ -68,6 +68,9 @@ export const errors = {
   choosePrereqs: "בחרו לקוח וסוג צילום — בלעדיהם אין למה לפתוח בקשה",
   invalidAction: "הפעולה לא זוהתה — רעננו את המסך ונסו שוב",
   holdStillLive: "השמירה עדיין בתוקף — שלחו ללקוח תזכורת במקום לשחרר אותה",
+  noMatchFound: "לא נמצאה התאמה כרגע — בדקו זמינות צלמים באזור או הרחיבו את חלונות הזמן",
+  dayOverbooked: "ליום הזה הוצעו יותר בקשות ממספר החלונות הפנויים — הריצו שיבוץ מחדש",
+  actionFailed: "הפעולה נכשלה — נסו שוב, ואם זה חוזר פנו לתמיכה",
 };
 
 /** Timeline annotations the services write directly (not via workflow events). */
@@ -260,8 +263,8 @@ export const suggestionLabels: Record<SuggestionKey, { button: string; explain: 
     explain: "ביטול דורש טיפול ידני — סגרי לאחר שההמשך סוכם",
   },
   RUN_MATCHER: {
-    button: "פתח את הבקשה",
-    explain: "אין עדיין שיבוץ — מנוע השיבוץ יציע מועמדים בפאזה הבאה",
+    button: "הרץ שיבוץ עכשיו",
+    explain: "הבקשה ממתינה לשיבוץ — הרצה תציע ימים וזיווגים לאישורך",
   },
   OPEN_REQUEST: {
     button: "פתח את הבקשה",
@@ -398,6 +401,11 @@ export const notifyTemplates = {
     body: (name: string, url: string) =>
       `שלום ${name}, כאן זאפ דיגיטל 📸 כדי שנוכל לשבץ אותך לימי צילום, סמן בבקשה את הימים הפנויים שלך: ${url}`,
   },
+  dateOptions: {
+    title: "בחירת מועד ליום צילום",
+    body: (recipient: string, clientName: string, url: string) =>
+      `שלום ${recipient}, יש מועדים פנויים ליום הצילום של ${clientName}. לבחירה: ${url}`,
+  },
 };
 
 /** Supplier management screen. */
@@ -445,4 +453,59 @@ export const availabilityT = {
   invalidTitle: "הקישור אינו תקף",
   invalidBody: "הקישור פג או הוחלף. בקשו קישור חדש מהרכזת.",
   weekOf: (d: string) => `שבוע ${d}`,
+};
+
+/** Why the matcher proposed what it proposed — Noam must be able to interrogate every row. */
+export const matcherReasons = {
+  paired: (p: {
+    partnerName: string;
+    travelMinutes: number;
+    supplierName: string;
+    region: string | null;
+    daysWaited: number;
+  }) =>
+    `יום מזווג עם ${p.partnerName} (כ־${p.travelMinutes} דק' נסיעה)` +
+    ` · ${p.supplierName} פנוי${p.region ? ` ב${p.region}` : ""}` +
+    (p.daysWaited > 0 ? ` · ממתין ${p.daysWaited} ימים` : ""),
+  solo: (p: { supplierName: string; date: string; region: string | null; daysWaited: number }) =>
+    `${p.supplierName} פנוי ב־${shortDate(p.date)}${p.region ? ` ב${p.region}` : ""} (ללא זיווג כרגע)` +
+    (p.daysWaited > 0 ? ` · ממתין ${p.daysWaited} ימים` : ""),
+  replacement: (p: { supplierName: string; date: string }) =>
+    `מועמד להשלמת חצי היום של ${p.supplierName} ב־${shortDate(p.date)}`,
+};
+
+/** The client date-selection page (/c/[token]). */
+export const chooseT = {
+  title: "בחירת מועד ליום הצילום",
+  hello: (client: string) => `שלום ${client} 👋`,
+  explain: "אלו המועדים ששמורים עבורכם. בחרו את הנוח לכם — הראשון שמאשר, סוגר.",
+  option: (date: string, start: string, end: string) => `${date} · ${start}–${end}`,
+  choose: "אישור המועד הזה",
+  noneFits: "אף מועד לא מתאים",
+  confirmedTitle: "המועד נקבע! 🎉",
+  confirmedBody: (date: string) => `יום הצילום שלכם נקבע ל־${date}. נשלח תזכורות ופרטים לקראת המועד.`,
+  declinedTitle: "קיבלנו, תודה",
+  declinedBody: "נחפש מועדים חדשים ונחזור אליכם בהקדם.",
+  alreadyUsedTitle: "הקישור כבר נוצל",
+  alreadyUsedBody: "המועד כבר נבחר דרך הקישור הזה. לשינויים — פנו למנהל הסושיאל שלכם.",
+  invalidTitle: "הקישור אינו תקף",
+  invalidBody: "הקישור פג או הוחלף. פנו למנהל הסושיאל שלכם לקבלת קישור חדש.",
+  optionGone: "המועד הזה כבר לא זמין — רעננו את העמוד לראות את המצב העדכני",
+};
+
+/** Proposals card on the request page — Noam interrogates the matcher here. */
+export const proposalsT = {
+  title: "הצעות שיבוץ",
+  score: "ניקוד",
+  paired: "מזווג",
+  solo: "ללא זיווג",
+  statusLabels: {
+    SENT: "נשלח",
+    CHOSEN: "נבחר",
+    DECLINED: "נדחה",
+    EXPIRED: "פג",
+    SUPERSEDED: "הוחלף",
+  } as Record<string, string>,
+  candidates: "מועמדים להחלפה",
+  none: "אין הצעות פעילות",
 };

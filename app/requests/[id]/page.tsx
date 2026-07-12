@@ -6,13 +6,15 @@ import { Badge } from "@/components/ui/badge";
 import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { db } from "@/db/client";
-import { clients, events, shootRequests } from "@/db/schema";
+import { clients, events, shootRequests, slotProposals } from "@/db/schema";
 import {
   actionLabels,
   detail,
   form as formT,
   ownerLabels,
+  proposalsT,
   shootTypeLabels,
+  shortDate,
   statusLabels,
 } from "@/lib/i18n/he";
 
@@ -50,6 +52,12 @@ export default async function RequestDetailPage({
     .from(events)
     .where(and(eq(events.entityType, "shoot_request"), eq(events.entityId, id)))
     .orderBy(desc(events.createdAt), desc(events.id));
+
+  const proposals = await db()
+    .select()
+    .from(slotProposals)
+    .where(eq(slotProposals.shootRequestId, id))
+    .orderBy(desc(slotProposals.createdAt));
 
   return (
     <main className="mx-auto max-w-2xl px-4 py-6">
@@ -103,6 +111,41 @@ export default async function RequestDetailPage({
             {formT.editTitle}
           </Link>
         </div>
+      ) : null}
+
+      {proposals.length > 0 ? (
+        <Card className="mt-6">
+          <CardHeader>
+            <CardTitle>{proposalsT.title}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ul className="flex flex-col gap-3">
+              {proposals.map((p) => (
+                <li key={p.id} className="rounded-lg border p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold">
+                      {shortDate(p.date)} · {p.startTime.slice(0, 5)}–{p.endTime.slice(0, 5)}
+                    </span>
+                    <Badge variant={p.pairedDayId ? "secondary" : "outline"}>
+                      {p.pairedDayId ? proposalsT.paired : proposalsT.solo}
+                    </Badge>
+                    <Badge variant="outline">
+                      {proposalsT.statusLabels[p.status] ?? p.status}
+                    </Badge>
+                    {p.score ? (
+                      <span className="text-xs text-muted-foreground">
+                        {proposalsT.score}: {Number(p.score).toFixed(0)}
+                      </span>
+                    ) : null}
+                  </div>
+                  {p.reason ? (
+                    <p className="mt-1 text-sm text-muted-foreground">{p.reason}</p>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
       ) : null}
 
       <Card className="mt-6">

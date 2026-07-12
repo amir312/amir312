@@ -186,7 +186,12 @@ export type Effect =
   | { type: "SET_DAY_STATUS"; dayId: string; status: SupplierDayStatus }
   | { type: "RELEASE_DAY"; dayId: string }
   | { type: "RELEASE_HALF_DAY"; dayId: string }
-  | { type: "CONFIRM_SLOT"; dayId: string; shootDate: string }
+  | {
+      type: "CONFIRM_SLOT";
+      dayId: string;
+      shootDate: string;
+      confirmedBy: "CLIENT" | "SOCIAL_MANAGER" | "COORDINATOR";
+    }
   | { type: "SUPERSEDE_PROPOSALS" }
   | { type: "REMATCH_HALF"; dayId: string; date: string; region: string | null }
   | { type: "CONSUME_ENTITLEMENT" };
