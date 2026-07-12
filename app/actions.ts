@@ -9,7 +9,10 @@ import { createAndSubmitRequest, updateAndResubmitRequest } from "@/lib/services
 import { executeSuggestion } from "@/lib/services/console";
 import { requestPrereqs } from "@/lib/validation/request";
 import { SUGGESTION_KEYS } from "@/lib/workflow/suggestions";
-import { console_, errors } from "@/lib/i18n/he";
+import { availabilityT, console_, errors, suppliersT } from "@/lib/i18n/he";
+import { supplierInput } from "@/lib/validation/supplier";
+import { createSupplier, updateSupplier } from "@/lib/services/suppliers";
+import { submitAvailability, verifyAvailabilityToken } from "@/lib/services/availability";
 
 function str(v: FormDataEntryValue | null): string | undefined {
   const s = typeof v === "string" ? v.trim() : "";
@@ -135,4 +138,76 @@ export async function switchUserAction(fd: FormData): Promise<void> {
     });
   }
   revalidatePath("/", "layout");
+}
+
+export interface SupplierActionState {
+  error?: string;
+}
+
+export async function saveSupplierAction(
+  supplierId: string | null,
+  _prev: SupplierActionState,
+  fd: FormData,
+): Promise<SupplierActionState> {
+  await currentUser(); // staff-only surface
+  const parsed = supplierInput.safeParse({
+    name: str(fd.get("name")),
+    phone: str(fd.get("phone")) ?? null,
+    email: str(fd.get("email")) ?? null,
+    capabilities: fd.getAll("capabilities").map(String),
+    serviceRegions: fd.getAll("serviceRegions").map(String),
+    acceptsSoloHalfDay: fd.get("acceptsSoloHalfDay") === "on",
+    deliverableSlaDays: str(fd.get("deliverableSlaDays")) ?? null,
+    active: fd.get("active") === "on",
+  });
+  if (!parsed.success) {
+    return { error: suppliersT.validationFailed };
+  }
+  if (supplierId) {
+    await updateSupplier(supplierId, parsed.data);
+  } else {
+    await createSupplier(parsed.data);
+  }
+  revalidatePath("/suppliers");
+  redirect("/suppliers");
+}
+
+export interface AvailabilityActionState {
+  error?: string;
+  savedCount?: number;
+}
+
+const availabilityInput = z.object({
+  token: z.string().min(10),
+  marked: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}\|\d{2}:\d{2}$/)).max(200),
+  note: z.string().max(2000).nullish(),
+});
+
+export async function submitAvailabilityAction(
+  _prev: AvailabilityActionState,
+  fd: FormData,
+): Promise<AvailabilityActionState> {
+  // No staff session here — the TOKEN is the credential, re-verified server-side.
+  const parsed = availabilityInput.safeParse({
+    token: str(fd.get("token")),
+    marked: fd.getAll("marked").map(String),
+    note: str(fd.get("note")) ?? null,
+  });
+  if (!parsed.success) {
+    return { error: errors.invalidAction };
+  }
+  const verified = await verifyAvailabilityToken(parsed.data.token);
+  if (!verified.ok || !verified.token.supplierId) {
+    return { error: availabilityT.invalidTitle };
+  }
+  const windows = parsed.data.marked.map((m) => {
+    const [date, start] = m.split("|");
+    return { date, start };
+  });
+  const { saved } = await submitAvailability(
+    verified.token.supplierId,
+    windows,
+    parsed.data.note ?? null,
+  );
+  return { savedCount: saved };
 }

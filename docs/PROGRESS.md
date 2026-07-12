@@ -159,3 +159,61 @@ transitions.ts at 100/100 lines and branches).
 3. The auth shim is a cookie-based "act as" switcher for the pilot (attribution only, clearly
    marked); real Supabase Auth lands before external exposure.
 4. `getUpcoming` flags `halfFree` days so the pairing opportunity is visible in phase 1 already.
+
+---
+
+## Phase 2 — Suppliers, availability, soft holds
+
+**Built:**
+- `/suppliers` + `/suppliers/new` + `/suppliers/[id]/edit` — supplier CRUD: capabilities,
+  service regions, `accepts_solo_half_day` (full-day-only suppliers get a loud amber badge),
+  per-supplier deliverable-SLA override, active flag. Staff-side, zod-validated.
+- `lib/tokens.ts` — signed single-purpose links (invariant 9): 256-bit random token, SHA-256
+  hash stored (never the raw), purpose + expiry + revocation (+ opt-in one-shot enforcement
+  for phase 3's CHOOSE_DATE).
+- `/s/[token]` — the photographer availability page: mobile-first, no account. A week-grouped
+  grid of the rule-defined 4h windows (`availability_windows`) for `supplier_availability_weeks`
+  ahead, plus notes. Held/booked windows render as locked ("שמור"/"משובץ") — the workflow owns
+  them. ALL supplier reads/writes run under the `supplier_portal` Postgres role with
+  `app.supplier_id` set (invariant 7) — proven by a deliberately-unfiltered query test.
+- `lib/services/holds.ts` — `placeHold()` (whole day, duration from `rules.hold_duration_hours`,
+  HOLD_PLACED spine per request) and `releaseExpiredHolds()` — THE five-minute job: releases
+  expired holds, fires HOLD_EXPIRED with truthful per-half pairing context, notifies a confirmed
+  partner on their timeline, frees crash residue, and is fault-isolated (savepoint per request,
+  try/catch per day — one wedged day cannot starve the run).
+- Inngest: `release-expired-holds` (*/5) + `weekly-availability-request` (Sunday 08:00
+  Asia/Jerusalem) — both are thin wrappers over idempotent services.
+- Weekly job: per-ISO-week idempotency key, ACTIVE suppliers only, link TTL from rules, the
+  previous week's link revoked on reissue, FAILED deliveries retriable.
+
+**Acceptance criteria (executed, not assumed):**
+
+| criterion | result |
+| --- | --- |
+| RLS isolation test passes | **PASS** — phase-0 policy proofs + NEW service-path proof: unfiltered `select` inside the token path returns only the token's supplier; `current_user = supplier_portal` |
+| Hold-expiry job idempotent — run twice, identical result | **PASS** — second run releases nothing; events AND incidents counts unchanged (both scenarios) |
+| HOLD_EXPIRED → request PENDING_MATCH + slot released | **PASS** — proven for zero-of-two (whole day freed, day CANCELLED, no incident) and one-of-two (confirmer untouched, HALF_DAY_FREE incident, partner notified) |
+| `pnpm typecheck` / `lint` / `test` / `build` | **PASS** ×4 — 114 unit/DB tests |
+| e2e | **PASS** — 22 (supplier CRUD round-trip, availability mark→save→persist, garbage token screen, visuals at desktop+390px) |
+
+**Reviewer findings and fixes** (fresh-context subagent; all re-verified):
+
+| # | severity | finding | resolution |
+| --- | --- | --- | --- |
+| P2-1 | MAJOR | the RAW availability token was persisted inside `notifications.payload.url` (probe-proven recoverable) — invariant 9 reduced to theater | `sendNotification` now persists a REDACTED payload (`redacted.body/url`, token replaced by `[link:<tokenId>]`); delivery still carries the real link; test asserts no raw token in storage |
+| P2-2 | MAJOR | a stale availability submit could insert an AVAILABLE duplicate of a window the workflow had since SOFT_HELD (probe-proven booking-truth corruption) | unique index `(supplier_id, date, start_time)` + `on conflict do nothing` insert + input dedup; RLS insert policy tightened to `status = 'AVAILABLE'`; race test added |
+| P2-3 | MAJOR | `releaseExpiredHolds` had no fault isolation — one pathological day (expired leftover + live sibling hold) aborted the entire run, forever | live-hold guard scoped to the request's OWN window; savepoint per request; try/catch per day with skip log; fault-isolation test (wedged day + healthy day) |
+| P2-4 | MINOR | weekly idempotency keyed by run-DATE not ISO week; FAILED sends never retried and counted as "skipped" | real ISO-week key (`isoWeekKey`), FAILED rows fall through to the retry path, `{sent, skipped, failed}` |
+| P2-5 | MINOR | `reset role` in `asSupplier` masked the original error on aborted transactions | reset wrapped in its own try/catch; deployment note recorded (prod app role needs `GRANT supplier_portal`) |
+| P2-6 | MINOR | tests didn't prove the service path actually engages RLS (app-side filters alone passed everything) | `asSupplier` exported; new test runs a deliberately-unfiltered select under it |
+| P2-7 | MINOR | rules keys added by editing already-applied migration 0000 | accepted while NO persistent environment exists (dev/CI/test all rebuild from zero) — **decision: 0000 is frozen at first persistent deploy; later changes ship as `db/migrations/NNNN_*.sql`** |
+| P2-8 | MINOR | staff surfaces sit behind the dev auth shim while phase 2 starts issuing app URLs to outsiders | **precondition recorded: `notify_channel_default` must NOT leave CONSOLE until real staff auth lands.** Links currently reach the server log only |
+| NITs | — | one-shot enforcement missing for future purposes; dev-token TTL hardcoded; unordered note pick; 3rd-window mislabel; weak one-confirmed idempotency assert; CLAUDE.md pairing-doc drift; e2e Hebrew literals | all fixed: `verifyToken(..., {oneShot})` + USED reason; TTL from rules; newest-first note; label falls back to times; incident/event-count asserts; doc updated; labels imported |
+
+**Decisions the spec did not dictate:**
+1. Each weekly link REVOKES the previous one — exactly one live availability link per supplier.
+2. Availability windows/collection horizon/link TTL are rules (`availability_windows`,
+   `supplier_availability_weeks`, `availability_link_ttl_days`) — a third daily window is a
+   config change, not a deploy.
+3. `expireHold` refuses live holds by default (`force` opt-out) and notifies a confirmed
+   partner via PAIR_PARTNER_DECLINED on their timeline.

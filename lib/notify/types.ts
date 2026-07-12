@@ -11,6 +11,12 @@ export interface OutboundMessage {
   title: string;
   body: string;
   url?: string;
+  /**
+   * What gets PERSISTED in the notifications row instead of body/url.
+   * REQUIRED whenever body/url embed a secret (a signed-link token): the raw
+   * token must never be stored — only delivered. (invariant 9)
+   */
+  redacted?: { body?: string; url?: string };
   entityType?: string;
   entityId?: string;
   /**

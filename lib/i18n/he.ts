@@ -390,3 +390,59 @@ export function incidentSummary(
       return `הצלם ביטל יום צילום${day ? ` — ${day}` : ""}`;
   }
 }
+
+/** Outbound message texts (mirrors docs/whatsapp-templates.md). */
+export const notifyTemplates = {
+  availabilityRequest: {
+    title: "עדכון זמינות לצילומים",
+    body: (name: string, url: string) =>
+      `שלום ${name}, כאן זאפ דיגיטל 📸 כדי שנוכל לשבץ אותך לימי צילום, סמן בבקשה את הימים הפנויים שלך: ${url}`,
+  },
+};
+
+/** Supplier management screen. */
+export const suppliersT = {
+  title: "צלמים וספקים",
+  add: "צלם חדש",
+  edit: "עריכת צלם",
+  name: "שם",
+  phone: "טלפון",
+  email: "אימייל",
+  capabilities: "סוגי צילום",
+  regions: "אזורי שירות",
+  acceptsSoloHalfDay: "מקבל חצי יום בודד",
+  acceptsSoloExplain: "אם לא — התפנות חצי יום אצלו תמיד עולה להכרעת הרכזת",
+  slaOverride: "SLA מסירה (ימי עסקים)",
+  slaOverridePlaceholder: "ברירת מחדל מהגדרות המערכת",
+  active: "פעיל",
+  inactive: "מושהה",
+  save: "שמירה",
+  saved: "נשמר",
+  fullDayOnly: "יום מלא בלבד",
+  soloOk: "גם חצי יום",
+  none: "אין צלמים עדיין — הוסיפו את הראשון",
+  sendAvailabilityLink: "שלח קישור זמינות",
+  linkSent: "הקישור נשלח",
+  backToConsole: "חזרה למסך הראשי",
+  validationFailed: "בדקו שם, לפחות סוג צילום אחד ולפחות אזור אחד",
+};
+
+/** The photographer's availability page (/s/[token]). */
+export const availabilityT = {
+  title: "הזמינות שלי",
+  hello: (name: string) => `שלום ${name} 👋`,
+  explain: (weeks: number) => `סמן את החלונות הפנויים שלך ל־${weeks} השבועות הקרובים. לוקח פחות מדקה.`,
+  morning: "בוקר",
+  afternoon: "צהריים",
+  held: "שמור",
+  booked: "משובץ",
+  notes: "הערות",
+  notesPlaceholder: "למשל: בימי שישי רק עד 14:00…",
+  save: "שמירת זמינות",
+  savedTitle: "הזמינות נשמרה, תודה!",
+  savedBody: "אפשר לחזור ולעדכן דרך אותו קישור בכל רגע.",
+  savedCount: (n: number) => `${n} חלונות פנויים סומנו`,
+  invalidTitle: "הקישור אינו תקף",
+  invalidBody: "הקישור פג או הוחלף. בקשו קישור חדש מהרכזת.",
+  weekOf: (d: string) => `שבוע ${d}`,
+};

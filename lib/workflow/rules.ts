@@ -45,6 +45,21 @@ export class Rules {
     }
     return v as number[];
   }
+
+  windows(key: string): Array<{ start: string; end: string }> {
+    const v = this.raw(key);
+    const ok =
+      Array.isArray(v) &&
+      v.every(
+        (w) =>
+          typeof w === "object" &&
+          w !== null &&
+          typeof (w as { start?: unknown }).start === "string" &&
+          typeof (w as { end?: unknown }).end === "string",
+      );
+    if (!ok) throw new RuleError(key, "must be an array of {start,end} time windows");
+    return v as Array<{ start: string; end: string }>;
+  }
 }
 
 /** Rule keys used by the workflow. Keep in sync with the seed in db/schema.sql. */
@@ -69,6 +84,8 @@ export const RULE = {
   matchApprovalEscalateHours: "match_approval_escalate_hours",
   shootDayEndHour: "shoot_day_end_hour",
   supplierAvailabilityWeeks: "supplier_availability_weeks",
+  availabilityWindows: "availability_windows",
+  availabilityLinkTtlDays: "availability_link_ttl_days",
   upcomingHorizonDays: "upcoming_horizon_days",
   reminderWindowHours: "reminder_window_hours",
   timezone: "timezone",

@@ -2,9 +2,11 @@
  * Hold lifecycle services. Pairing truth is assembled here, inside the same
  * transaction that applies the event — the pure machine never guesses.
  */
-import { and, eq, inArray, ne } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, lte, ne } from "drizzle-orm";
+import { db } from "@/db/client";
 import type { Tx } from "@/db/client";
 import {
+  shootRequests,
   shootSlots,
   slotProposals,
   supplierAvailability,
@@ -12,7 +14,9 @@ import {
   suppliers,
 } from "@/db/schema";
 import { errors } from "@/lib/i18n/he";
-import { applyTransition } from "@/lib/workflow/apply";
+import { applyTransition, loadRules } from "@/lib/workflow/apply";
+import { RULE } from "@/lib/workflow/rules";
+import { addHours } from "@/lib/workflow/time";
 import type { Actor, Effect, PairingContext } from "@/lib/workflow/types";
 
 /**
@@ -188,8 +192,15 @@ export async function expireHold(
   if (!dayId) throw new Error(`request ${requestId} has no held day to release`);
 
   if (!opts.force) {
+    // Guard on the REQUEST'S OWN window only: an unrelated live hold on the
+    // other half of the day must not block releasing this one (and a stale
+    // leftover on the day must not wedge the safety-net job).
     const held = await tx
-      .select({ heldUntil: supplierAvailability.heldUntil })
+      .select({
+        heldUntil: supplierAvailability.heldUntil,
+        startTime: supplierAvailability.startTime,
+        endTime: supplierAvailability.endTime,
+      })
       .from(supplierAvailability)
       .where(
         and(
@@ -197,7 +208,15 @@ export async function expireHold(
           eq(supplierAvailability.status, "SOFT_HELD"),
         ),
       );
-    const stillLive = held.some((w) => w.heldUntil !== null && w.heldUntil > at);
+    const [own] = await tx
+      .select({ startTime: slotProposals.startTime, endTime: slotProposals.endTime })
+      .from(slotProposals)
+      .where(and(eq(slotProposals.shootRequestId, requestId), eq(slotProposals.pairedDayId, dayId)))
+      .limit(1);
+    const relevant = own
+      ? held.filter((w) => w.startTime < own.endTime && own.startTime < w.endTime)
+      : held;
+    const stillLive = relevant.some((w) => w.heldUntil !== null && w.heldUntil > at);
     if (stillLive) throw new Error(errors.holdStillLive);
   }
 
@@ -217,5 +236,148 @@ export async function expireHold(
 
   const remaining = await executeBookingEffects(tx, requestId, outcome.deferred);
   assertOnlyRematchDeferred(remaining, "expireHold");
+
+  // The confirmed partner (if any) hears about it on their own timeline —
+  // their spine is untouched, by the paired-confirmation rule.
+  if (pairing.partnerStatus === "CONFIRMED" && pairing.partnerRequestId) {
+    await applyTransition(tx, pairing.partnerRequestId, {
+      kind: "PAIR_PARTNER_DECLINED",
+      at,
+      actor: { type: "SYSTEM" },
+      partnerRequestId: requestId,
+      cause: "HOLD_EXPIRED",
+    });
+  }
   return outcome;
+}
+
+/**
+ * Soft-hold the ENTIRE supplier day (both halves) and put CHOOSE_DATE on each
+ * request's spine. Duration comes from rules.hold_duration_hours — never from
+ * code. (invariant 4: the availability CHECK refuses a hold without expiry.)
+ */
+export async function placeHold(
+  tx: Tx,
+  opts: {
+    dayId: string;
+    at: Date;
+    actor: Actor;
+    choosers: Array<{ requestId: string; chooser: { type: "CLIENT" | "SOCIAL_MANAGER"; id: string } }>;
+  },
+): Promise<{ heldUntil: Date }> {
+  const rules = await loadRules(tx);
+  const heldUntil = addHours(opts.at, rules.int(RULE.holdDurationHours));
+
+  const [day] = await tx.select().from(supplierDays).where(eq(supplierDays.id, opts.dayId));
+  if (!day) throw new Error(`supplier_day ${opts.dayId} not found`);
+
+  const updated = await tx
+    .update(supplierAvailability)
+    .set({ status: "SOFT_HELD", heldUntil, heldForDayId: opts.dayId })
+    .where(
+      and(
+        eq(supplierAvailability.supplierId, day.supplierId),
+        eq(supplierAvailability.date, day.date),
+        eq(supplierAvailability.status, "AVAILABLE"),
+      ),
+    )
+    .returning({ id: supplierAvailability.id });
+  if (updated.length === 0) {
+    throw new Error(`supplier_day ${opts.dayId} has no available windows to hold`);
+  }
+
+  for (const { requestId, chooser } of opts.choosers) {
+    await applyTransition(tx, requestId, {
+      kind: "HOLD_PLACED",
+      at: opts.at,
+      actor: opts.actor,
+      dayId: opts.dayId,
+      heldUntil,
+      chooser,
+    });
+  }
+  return { heldUntil };
+}
+
+/**
+ * THE five-minute job body: release every expired hold and fire HOLD_EXPIRED
+ * for each request still waiting on it. Idempotent by construction — a second
+ * run finds no expired SOFT_HELD windows and does nothing.
+ *
+ * Pairing truth per request is assembled at execution time: with zero
+ * confirmations the first release frees its half and the second (seeing the
+ * partner already RELEASED) frees the whole day; with one confirmed, only the
+ * unconfirmed half expires and the confirmer is never touched.
+ */
+export async function releaseExpiredHolds(
+  now = new Date(),
+): Promise<{ releasedRequests: string[] }> {
+  const expired = await db()
+    .selectDistinct({ dayId: supplierAvailability.heldForDayId })
+    .from(supplierAvailability)
+    .where(
+      and(
+        eq(supplierAvailability.status, "SOFT_HELD"),
+        lte(supplierAvailability.heldUntil, now),
+        isNotNull(supplierAvailability.heldForDayId),
+      ),
+    );
+
+  const releasedRequests: string[] = [];
+  const skipped: Array<{ dayId: string; requestId?: string; reason: string }> = [];
+
+  for (const { dayId } of expired) {
+    if (!dayId) continue;
+    try {
+      await db().transaction(async (tx) => {
+        const waiting = await tx
+          .select({ requestId: slotProposals.shootRequestId })
+          .from(slotProposals)
+          .innerJoin(shootRequests, eq(shootRequests.id, slotProposals.shootRequestId))
+          .where(
+            and(
+              eq(slotProposals.pairedDayId, dayId),
+              eq(slotProposals.status, "SENT"),
+              eq(shootRequests.status, "SOFT_HELD"),
+            ),
+          );
+        for (const w of waiting) {
+          // Savepoint per request: a race (client confirming right now, a
+          // live sibling hold) skips THIS request without poisoning the day
+          // transaction or the rest of the run.
+          try {
+            await tx.transaction(async (inner) => {
+              await expireHold(inner, w.requestId, now, { type: "SYSTEM" });
+            });
+            releasedRequests.push(w.requestId);
+          } catch (err) {
+            skipped.push({
+              dayId,
+              requestId: w.requestId,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        // Free leftover expired windows nothing is waiting on (crash residue),
+        // so a day can never stay wedged.
+        await tx
+          .update(supplierAvailability)
+          .set({ status: "AVAILABLE", heldUntil: null, heldForDayId: null })
+          .where(
+            and(
+              eq(supplierAvailability.heldForDayId, dayId),
+              eq(supplierAvailability.status, "SOFT_HELD"),
+              lte(supplierAvailability.heldUntil, now),
+            ),
+          );
+      });
+    } catch (err) {
+      // One broken day must not starve the rest — THE safety-net job keeps going.
+      skipped.push({ dayId, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  if (skipped.length > 0) {
+    console.error("releaseExpiredHolds skipped:", JSON.stringify(skipped));
+  }
+  return { releasedRequests };
 }

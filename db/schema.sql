@@ -42,6 +42,8 @@ insert into rules (key, value, description) values
   ('match_approval_escalate_hours',   '48',      'An unreviewed proposal past this is escalated'),
   ('shoot_day_end_hour',              '20',      'Local hour by which a shoot day is considered over'),
   ('supplier_availability_weeks',     '3',       'How many weeks ahead the availability link collects'),
+  ('availability_windows',            '[{"start":"08:00","end":"12:00"},{"start":"13:00","end":"17:00"}]', 'The 4h windows a supplier can mark per day'),
+  ('availability_link_ttl_days',      '10',      'How long a weekly availability link stays valid'),
   ('upcoming_horizon_days',           '7',       'How many days ahead the console''s upcoming-shoots list looks'),
   ('reminder_window_hours',           '24',      'A manual reminder for the same request can be re-sent after this window'),
   ('timezone',                        '"Asia/Jerusalem"', 'Timezone used to interpret hour-of-day rules'),
@@ -154,6 +156,10 @@ create table supplier_availability (
 );
 create index on supplier_availability (supplier_id, date);
 create index on supplier_availability (status, held_until);
+-- One row per supplier per window — a stale re-submit must never duplicate a
+-- window that the workflow holds or confirmed.
+create unique index supplier_availability_window_key
+  on supplier_availability (supplier_id, date, start_time);
 
 -- ─────────────────────────────────────────────────────────────
 -- The core: a supplier DAY holds 1–2 client SLOTS.
@@ -536,8 +542,10 @@ create policy supplier_sees_own_slots on shoot_slots
 create policy supplier_reads_own_availability on supplier_availability
   for select using (supplier_id = app_supplier_id());
 
+-- A supplier can only ever CONTRIBUTE free windows; held/confirmed statuses
+-- are workflow-owned and unreachable from the portal role.
 create policy supplier_adds_own_availability on supplier_availability
-  for insert with check (supplier_id = app_supplier_id());
+  for insert with check (supplier_id = app_supplier_id() and status = 'AVAILABLE');
 
 -- A supplier may edit/remove only windows the workflow is not using:
 -- SOFT_HELD and CONFIRMED rows belong to the booking flow. Without the status

@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { buttonVariants } from "@/components/ui/button";
 import { switchUserAction } from "@/app/actions";
-import { appName, console_ } from "@/lib/i18n/he";
+import { appName, console_, suppliersT } from "@/lib/i18n/he";
 import type { SessionUser } from "@/lib/auth";
 
 function todayIn(tz: string): string {
@@ -44,6 +44,9 @@ export function ConsoleHeader({ user, users, tz }: { user: SessionUser; users: S
             ✓
           </button>
         </form>
+        <Link href="/suppliers" className={buttonVariants({ variant: "outline", size: "default" })}>
+          {suppliersT.title}
+        </Link>
         <Link href="/requests/new" className={buttonVariants({ size: "default" })}>
           {console_.newRequest}
         </Link>

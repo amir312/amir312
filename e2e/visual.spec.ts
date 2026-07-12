@@ -3,8 +3,8 @@
  * (runs under both the desktop and the 390px projects) into docs/screenshots.
  */
 import { test, expect } from "@playwright/test";
-import { console_ } from "@/lib/i18n/he";
-import { reseed } from "./helpers";
+import { console_, suppliersT } from "@/lib/i18n/he";
+import { issueAvailabilityToken, reseed } from "./helpers";
 
 test.beforeAll(() => {
   reseed();
@@ -49,4 +49,17 @@ test("request detail shows the unified timeline", async ({ page }, testInfo) => 
   await page.getByRole("link", { name: console_.openRequest }).first().click();
   await expect(page.getByRole("heading", { name: "ציר זמן" })).toBeVisible();
   await page.screenshot({ path: shotName(testInfo, "request-detail"), fullPage: true });
+});
+
+test("suppliers screen renders", async ({ page }, testInfo) => {
+  await page.goto("/suppliers");
+  await expect(page.getByRole("heading", { name: suppliersT.title })).toBeVisible();
+  await page.screenshot({ path: shotName(testInfo, "suppliers"), fullPage: true });
+});
+
+test("availability link renders", async ({ page }, testInfo) => {
+  const token = issueAvailabilityToken();
+  await page.goto(`/s/${token}`);
+  await expect(page.getByRole("heading", { level: 1 })).toContainText("שלום");
+  await page.screenshot({ path: shotName(testInfo, "availability"), fullPage: true });
 });

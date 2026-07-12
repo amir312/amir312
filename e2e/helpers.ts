@@ -11,3 +11,15 @@ export function reseed(): void {
     timeout: 120_000,
   });
 }
+
+/** Issue a fresh SUPPLIER_AVAILABILITY token for the first active supplier. */
+export function issueAvailabilityToken(): string {
+  return execSync("pnpm exec tsx db/dev-token.ts", {
+    env: { ...process.env, DATABASE_URL },
+    timeout: 60_000,
+  })
+    .toString()
+    .trim()
+    .split("\n")
+    .pop()!;
+}

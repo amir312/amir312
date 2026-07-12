@@ -23,6 +23,18 @@ const adapters: Partial<Record<Channel, NotifierAdapter>> = {
   // EMAIL (Resend) and WHATSAPP (Cloud API) register here in phase 2.
 };
 
+/**
+ * What lands in the durable notifications row. Secrets (signed-link tokens)
+ * are delivered, never persisted — callers pass `redacted` replacements.
+ */
+function storagePayload(message: OutboundMessage): Record<string, unknown> {
+  return {
+    title: message.title,
+    body: message.redacted?.body ?? message.body,
+    url: message.redacted ? (message.redacted.url ?? null) : (message.url ?? null),
+  };
+}
+
 export interface SendOptions {
   /** Runs inside the same transaction that records the notification row —
    *  use it to write timeline events atomically with the send record. */
@@ -55,10 +67,15 @@ export async function sendNotification(
         return { kind: "duplicate" as const };
       }
       if (existing) {
-        // A FAILED send must stay retriable — reuse the row.
+        // A FAILED send must stay retriable — reuse the row, refresh content.
         await tx
           .update(notifications)
-          .set({ status: "QUEUED", error: null })
+          .set({
+            status: "QUEUED",
+            error: null,
+            recipient: message.recipient,
+            payload: storagePayload(message),
+          })
           .where(eq(notifications.id, existing.id));
         return { kind: "deliver" as const, id: existing.id, adapter, fallbackNote };
       }
@@ -70,7 +87,7 @@ export async function sendNotification(
         channel: adapter.channel,
         recipient: message.recipient,
         template: message.template,
-        payload: { title: message.title, body: message.body, url: message.url ?? null },
+        payload: storagePayload(message),
         entityType: message.entityType ?? null,
         entityId: message.entityId ?? null,
         status: "QUEUED",

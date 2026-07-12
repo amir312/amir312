@@ -181,9 +181,11 @@ Say no if asked. They are all reasonable later; they all sink the pilot now.
   transaction themselves and pass it to `applyTransition(tx, …)`. Only `REMATCH_HALF` may run
   after commit. Never fire-and-forget a booking effect.
 - **Pairing truth is passed in, never guessed:** callers assemble `PairingContext`
-  (incl. `partnerStatus`) inside the same transaction that applies the event. When a whole day
-  expires with zero confirmations, the expiry job passes `partnerStatus: "RELEASED"` for both
-  halves so each transition releases the whole day (idempotently).
+  (incl. `partnerStatus`) inside the same transaction that applies the event
+  (`buildPairingContext` in lib/services/holds.ts derives it live per half). When a whole day
+  expires with zero confirmations the job releases sequentially — the first half sees
+  `partnerStatus: PENDING` (frees itself quietly), the second sees `RELEASED` (frees the whole
+  day) — same net outcome, atomic per day, idempotent.
 - **`events` and `entitlement_events` are append-only by trigger** (`forbid_mutation()`), not
   by convention.
 - **Hour-of-day rules are interpreted in `rules.timezone`** (Asia/Jerusalem);
