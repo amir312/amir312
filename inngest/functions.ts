@@ -10,6 +10,9 @@
 import { releaseExpiredHolds } from "@/lib/services/holds";
 import { matchAllPending, rematchFreeHalf } from "@/lib/services/matching";
 import { sendWeeklyAvailabilityRequests } from "@/lib/services/availability";
+import { sweepLateBriefs } from "@/lib/services/briefs";
+import { flagMissedT1, sendT1Links } from "@/lib/services/t1";
+import { flagOverdueDeliverables, sendUploadLinks } from "@/lib/services/deliverables";
 import { inngest } from "./client";
 
 function appOrigin(): string {
@@ -43,4 +46,49 @@ export const runMatcherFn = inngest.createFunction(
   },
 );
 
-export const functions = [releaseExpiredHoldsFn, weeklyAvailabilityFn, runMatcherFn];
+/**
+ * T-1 sweep, hourly: morning sends of the one-button link for tomorrow's
+ * shoots; past rules.t_minus_1_deadline_hour, un-pressed slots escalate.
+ * Both halves are guarded/windowed — a re-run changes nothing.
+ */
+export const t1SweepFn = inngest.createFunction(
+  { id: "t1-sweep", triggers: [{ cron: "5 * * * *" }] },
+  async () => {
+    const now = new Date();
+    const sent = await sendT1Links(now);
+    const missed = await flagMissedT1(now);
+    return { sent: sent.sent.length, flagged: missed.flagged.length };
+  },
+);
+
+/**
+ * Deliverables sweep, hourly: after shoot-day end the photographer gets the
+ * upload link; past the SLA the request escalates via DELIVERABLES_OVERDUE.
+ */
+export const deliverablesSweepFn = inngest.createFunction(
+  { id: "deliverables-sweep", triggers: [{ cron: "10 * * * *" }] },
+  async () => {
+    const now = new Date();
+    const links = await sendUploadLinks(now);
+    const overdue = await flagOverdueDeliverables(now);
+    return { uploadLinks: links.sent.length, flaggedOverdue: overdue.flagged.length };
+  },
+);
+
+/** Late briefs, hourly: windowed auto-reminders (escalation is the view's job). */
+export const briefSweepFn = inngest.createFunction(
+  { id: "brief-sweep", triggers: [{ cron: "15 * * * *" }] },
+  async () => {
+    const { reminded, skipped } = await sweepLateBriefs(new Date());
+    return { reminded: reminded.length, skipped: skipped.length };
+  },
+);
+
+export const functions = [
+  releaseExpiredHoldsFn,
+  weeklyAvailabilityFn,
+  runMatcherFn,
+  t1SweepFn,
+  deliverablesSweepFn,
+  briefSweepFn,
+];

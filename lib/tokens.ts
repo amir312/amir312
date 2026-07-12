@@ -102,6 +102,19 @@ export async function verifyToken(
   };
 }
 
+/**
+ * The purpose recorded for a raw token, or null if unknown. For ROUTING only
+ * (/c and /s render by purpose) — grants nothing; the page's own verifyToken
+ * call does the real expiry/revocation/one-shot checks.
+ */
+export async function peekTokenPurpose(db: DbLike, raw: string): Promise<TokenPurpose | null> {
+  const [row] = await db
+    .select({ purpose: accessTokens.purpose })
+    .from(accessTokens)
+    .where(eq(accessTokens.tokenHash, hashToken(raw)));
+  return (row?.purpose as TokenPurpose | undefined) ?? null;
+}
+
 /** Mark a one-shot token as used (idempotent — the first use wins). */
 export async function markTokenUsed(db: DbLike, id: string, at = new Date()): Promise<void> {
   await db

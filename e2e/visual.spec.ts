@@ -4,7 +4,14 @@
  */
 import { test, expect } from "@playwright/test";
 import { console_, suppliersT } from "@/lib/i18n/he";
-import { issueAvailabilityToken, issueChooseDateToken, reseed } from "./helpers";
+import {
+  issueAvailabilityToken,
+  issueBriefApprovalToken,
+  issueChooseDateToken,
+  issueT1Token,
+  issueUploadToken,
+  reseed,
+} from "./helpers";
 
 test.beforeAll(() => {
   reseed();
@@ -69,4 +76,25 @@ test("client date link renders", async ({ page }, testInfo) => {
   await page.goto(`/c/${token}`);
   await expect(page.getByRole("heading", { level: 1 })).toContainText("שלום");
   await page.screenshot({ path: shotName(testInfo, "choose-date"), fullPage: true });
+});
+
+test("brief approval link renders", async ({ page }, testInfo) => {
+  const token = issueBriefApprovalToken();
+  await page.goto(`/c/${token}`);
+  await expect(page.getByRole("button", { name: "הבריף מאושר" })).toBeVisible();
+  await page.screenshot({ path: shotName(testInfo, "brief-approval"), fullPage: true });
+});
+
+test("T-1 one-button link renders", async ({ page }, testInfo) => {
+  const token = issueT1Token();
+  await page.goto(`/s/${token}`);
+  await expect(page.getByRole("button", { name: "דיברתי עם הלקוח" })).toBeVisible();
+  await page.screenshot({ path: shotName(testInfo, "t1-confirm"), fullPage: true });
+});
+
+test("deliverables upload link renders", async ({ page }, testInfo) => {
+  const token = issueUploadToken();
+  await page.goto(`/s/${token}`);
+  await expect(page.getByRole("button", { name: "מסירת התוצרים" })).toBeVisible();
+  await page.screenshot({ path: shotName(testInfo, "deliverables-upload"), fullPage: true });
 });

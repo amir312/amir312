@@ -71,6 +71,11 @@ export const errors = {
   noMatchFound: "לא נמצאה התאמה כרגע — בדקו זמינות צלמים באזור או הרחיבו את חלונות הזמן",
   dayOverbooked: "ליום הזה הוצעו יותר בקשות ממספר החלונות הפנויים — הריצו שיבוץ מחדש",
   actionFailed: "הפעולה נכשלה — נסו שוב, ואם זה חוזר פנו לתמיכה",
+  briefLocked: "הבריף כבר אושר — גרסה מאושרת נעולה ואינה ניתנת לעריכה",
+  briefEmpty: "אין עדיין תוכן לבריף — כתבו לפחות את מטרת הצילום לפני שליחה",
+  briefNotFound: "לא נמצא בריף לבקשה הזו",
+  noteEmpty: "אי אפשר לשמור הערה ריקה",
+  driveUrlInvalid: "הקישור לא נראה תקין — הדביקו כתובת מלאה (https://…)",
 };
 
 /** Timeline annotations the services write directly (not via workflow events). */
@@ -78,6 +83,10 @@ export const timelineNotes = {
   reminderSent: (recipientName: string) => `נשלחה תזכורת אל ${recipientName}`,
   incidentResolved: (note?: string | null) => (note ? `החריג טופל — ${note}` : "החריג טופל"),
   eligibilityAutoOk: "זכאות אומתה — קיימת יתרה פנויה בחבילה",
+  manualNote: (text: string) => text,
+  briefDraftSaved: (version: number) => `נשמרה טיוטת בריף (גרסה ${version})`,
+  t1LinkSent: (supplierName: string) => `נשלח לצלם ${supplierName} קישור לאישור תיאום`,
+  uploadLinkSent: (supplierName: string) => `נשלח לצלם ${supplierName} קישור להעלאת תוצרים`,
 };
 
 /** Region codes are internal — users always see these. */
@@ -406,6 +415,31 @@ export const notifyTemplates = {
     body: (recipient: string, clientName: string, url: string) =>
       `שלום ${recipient}, יש מועדים פנויים ליום הצילום של ${clientName}. לבחירה: ${url}`,
   },
+  briefApproval: {
+    title: "אישור בריף ליום הצילום",
+    body: (clientName: string, shootDate: string, url: string) =>
+      `שלום ${clientName}, הבריף ליום הצילום שלכם (${shootDate}) מוכן לאישור. לצפייה ואישור: ${url}`,
+  },
+  briefToSupplier: {
+    title: "בריף מאושר ליום צילום",
+    body: (supplierName: string, clientName: string, shootDate: string, url: string) =>
+      `שלום ${supplierName}, הבריף המאושר לצילום של ${clientName} ב־${shootDate} מחכה לך: ${url}`,
+  },
+  t1Confirm: {
+    title: "תיאום לקראת צילום מחר",
+    body: (supplierName: string, clientName: string, shootDate: string, url: string) =>
+      `שלום ${supplierName}, מחר (${shootDate}) יום צילום אצל ${clientName}. דיברת עם הלקוח? אשר כאן בלחיצה: ${url}`,
+  },
+  uploadDeliverables: {
+    title: "העלאת תוצרים",
+    body: (supplierName: string, clientName: string, dueDate: string, url: string) =>
+      `שלום ${supplierName}, תודה על הצילום אצל ${clientName}! את התוצרים צריך למסור עד ${dueDate}. להעלאת קישור: ${url}`,
+  },
+  deliverablesForwarded: {
+    title: "התוצרים מוכנים",
+    body: (recipientName: string, clientName: string, url: string) =>
+      `שלום ${recipientName}, התוצרים מהצילום של ${clientName} התקבלו: ${url}`,
+  },
 };
 
 /** Supplier management screen. */
@@ -491,6 +525,124 @@ export const chooseT = {
   invalidTitle: "הקישור אינו תקף",
   invalidBody: "הקישור פג או הוחלף. פנו למנהל הסושיאל שלכם לקבלת קישור חדש.",
   optionGone: "המועד הזה כבר לא זמין — רעננו את העמוד לראות את המצב העדכני",
+};
+
+/** Brief content field labels — the template fields, editor + read views. */
+export const briefFields: Record<string, string> = {
+  goal: "מטרת הצילום",
+  shotList: "רשימת צילומים",
+  script: "תסריט",
+  products: "מוצרים / מנות לצילום",
+  wardrobe: "לבוש והנחיות לצוות",
+  doNotShoot: "מה לא לצלם",
+  notes: "הערות לצלם",
+};
+
+export const briefFieldPlaceholders: Record<string, string> = {
+  goal: "מה הצילום הזה צריך להשיג? למשל: חומרים לקמפיין קיץ באינסטגרם",
+  shotList: "שורה לכל צילום: חזית החנות, קלוז־אפ מוצר, צוות בעבודה…",
+  script: "מהלך הסרטון: פתיח, מסרים, קריאה לפעולה…",
+  products: "מה בדיוק מצלמים — מוצרים, מנות, שירותים",
+  wardrobe: "מה ללבוש, מה להכין מראש",
+  doNotShoot: "אזורים או פרטים שאסור שיופיעו",
+  notes: "כל דבר שחשוב שהצלם ידע",
+};
+
+/** The brief card + editor on the request page, and the client approval page. */
+export const briefT = {
+  cardTitle: "בריף",
+  statusLabels: {
+    NOT_REQUIRED: "לא נדרש",
+    NOT_STARTED: "טרם התחיל",
+    IN_PROGRESS: "בכתיבה",
+    CLIENT_REVIEW: "ממתין לאישור הלקוח",
+    CHANGES_REQUESTED: "הלקוח ביקש שינויים",
+    APPROVED: "אושר",
+    SENT_TO_SUPPLIER: "נשלח לצלם",
+  } as Record<string, string>,
+  dueBy: "דדליין לבריף",
+  version: (n: number) => `גרסה ${n}`,
+  approvedLocked: "הגרסה המאושרת נעולה — זה מה שהצלם רואה",
+  clientFeedback: "משוב הלקוח",
+  edit: "עריכת הבריף",
+  saveDraft: "שמירת טיוטה",
+  sendToClient: "שליחה לאישור הלקוח",
+  draftSaved: "הטיוטה נשמרה",
+  sentToClient: "הבריף נשלח לאישור הלקוח",
+  notStartedYet: "הבריף טרם נכתב — התחילו מהתבנית",
+  // client approval page (/c/[token])
+  approveTitle: "אישור בריף ליום הצילום",
+  approveHello: (client: string) => `שלום ${client} 👋`,
+  approveExplain: (date: string) =>
+    `זה הבריף ליום הצילום שלכם ב־${date}. עברו עליו — אם הכל נכון, אשרו; אם משהו חסר או לא מדויק, כתבו לנו מה לשנות.`,
+  approve: "הבריף מאושר",
+  requestChanges: "יש לי הערות",
+  feedbackLabel: "מה לשנות?",
+  feedbackPlaceholder: "כתבו כאן מה חסר או לא מדויק…",
+  approvedTitle: "הבריף אושר, תודה! 🎬",
+  approvedBody: "הצלם יקבל את הבריף המאושר, ונתראה ביום הצילום.",
+  changesTitle: "קיבלנו את ההערות",
+  changesBody: "נעדכן את הבריף ונשלח לאישור מחדש.",
+  alreadyDoneTitle: "הקישור כבר נוצל",
+  alreadyDoneBody: "הבריף כבר טופל דרך הקישור הזה. לשאלות — פנו למנהל הסושיאל שלכם.",
+};
+
+/** The photographer's T-1 one-button page (/s/[token]). */
+export const t1T = {
+  title: "תיאום לפני צילום",
+  hello: (name: string) => `שלום ${name} 👋`,
+  explain: (clientName: string, date: string, address: string | null) =>
+    `מחר, ${date}, יום צילום אצל ${clientName}${address ? ` — ${address}` : ""}.`,
+  question: "דיברת עם הלקוח ותיאמתם הגעה?",
+  confirm: "דיברתי עם הלקוח ✓",
+  confirmedTitle: "מעולה, נרשם!",
+  confirmedBody: "נתראה מחר בצילום. בהצלחה! 📸",
+  alreadyConfirmed: "התיאום כבר אושר — נתראה בצילום!",
+  briefLink: "לבריף המאושר",
+};
+
+/** The photographer's deliverables page (/s/[token]) + the request-page card. */
+export const deliverablesT = {
+  cardTitle: "תוצרים",
+  statusLabels: {
+    NOT_DUE: "טרם נדרש",
+    AWAITING_UPLOAD: "ממתין להעלאה",
+    PARTIAL: "הועלה חלקית",
+    DELIVERED: "התקבלו",
+    OVERDUE: "באיחור",
+    FORWARDED: "הועברו",
+    CLOSED: "נסגר",
+  } as Record<string, string>,
+  dueBy: "דדליין למסירה",
+  driveUrl: "קישור לתוצרים",
+  rawUrl: "קישור לחומרי גלם",
+  supplierNote: "הערת הצלם",
+  forwardedTo: (to: string) => `הועברו אל ${to}`,
+  // supplier page
+  uploadTitle: "מסירת תוצרים",
+  hello: (name: string) => `שלום ${name} 👋`,
+  shootDone: "הצילום בוצע?",
+  markDone: "הצילום בוצע ✓",
+  markedDone: "נרשם — עכשיו נשאר רק להעלות את התוצרים",
+  uploadExplain: (clientName: string, due: string) =>
+    `התוצרים מהצילום אצל ${clientName} — עד ${due}. הדביקו קישור לתיקייה (Drive / WeTransfer):`,
+  driveUrlLabel: "קישור לתוצרים הסופיים",
+  driveUrlPlaceholder: "https://drive.google.com/…",
+  rawUrlLabel: "קישור לחומרי גלם (רשות)",
+  noteLabel: "הערות",
+  notePlaceholder: "מה כלול, דגשים, קרדיטים…",
+  submit: "מסירת התוצרים",
+  submittedTitle: "התוצרים נמסרו, תודה! 🙌",
+  submittedBody: "הקישור הועבר ללקוח והבקשה נסגרה. נתראה בצילום הבא.",
+  alreadySubmitted: "התוצרים כבר נמסרו דרך הקישור הזה.",
+};
+
+/** Manual note form on the request page. */
+export const noteT = {
+  title: "הוספת הערה לציר הזמן",
+  placeholder: "שיחת טלפון, סיכום בוואטסאפ, כל הקשר שחשוב שיישאר כאן…",
+  add: "הוסף הערה",
+  added: "ההערה נוספה",
 };
 
 /** Proposals card on the request page — Noam interrogates the matcher here. */

@@ -332,6 +332,31 @@ create table brief_versions (
   unique (brief_id, version)
 );
 
+-- An APPROVED brief version is immutable — the photographer must see exactly
+-- what the client approved. Approving (false→true, nothing else changing) is
+-- the one permitted update; feedback lands on unapproved versions only.
+create function forbid_approved_brief_mutation() returns trigger language plpgsql as $$
+begin
+  if old.is_approved then
+    raise exception 'brief version % is approved and immutable', old.id;
+  end if;
+  if tg_op = 'DELETE' then
+    return old;
+  end if;
+  if new.is_approved
+     and (new.content is distinct from old.content
+       or new.brief_id is distinct from old.brief_id
+       or new.version is distinct from old.version
+       or new.author_id is distinct from old.author_id) then
+    raise exception 'approving a brief version must not change it';
+  end if;
+  return new;
+end $$;
+
+create trigger brief_versions_approved_immutable
+  before update or delete on brief_versions
+  for each row execute function forbid_approved_brief_mutation();
+
 -- ─────────────────────────────────────────────────────────────
 -- Deliverables — a link + metadata. We do not host raw footage.
 -- supplier_id is denormalized on purpose: it lets RLS scope rows directly.

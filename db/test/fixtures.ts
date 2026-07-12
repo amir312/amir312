@@ -1,5 +1,6 @@
 /** Shared row factories for DB-backed tests. */
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import * as s from "../schema";
 
@@ -74,6 +75,45 @@ export async function seedAvailability(
     })
     .returning();
   return row;
+}
+
+/**
+ * A CONFIRMED request with a real slot on a real supplier day — the starting
+ * state for brief/T-1/deliverables tests. The caller supplies the spine.
+ */
+export async function seedConfirmedShoot(
+  db: Db,
+  opts: {
+    clientId: string;
+    createdBy: string;
+    supplierId: string;
+    date: string;
+    requestOver?: Partial<typeof s.shootRequests.$inferInsert>;
+    startTime?: string;
+    endTime?: string;
+  },
+) {
+  const [day] = await db
+    .insert(s.supplierDays)
+    .values({ supplierId: opts.supplierId, date: opts.date, regionCode: "SHARON", status: "CONFIRMED" })
+    .returning();
+  const req = await seedRequest(db, opts.clientId, opts.createdBy, {
+    status: "CONFIRMED",
+    ...opts.requestOver,
+  });
+  const [slot] = await db
+    .insert(s.shootSlots)
+    .values({
+      supplierDayId: day.id,
+      shootRequestId: req.id,
+      clientId: opts.clientId,
+      startTime: opts.startTime ?? "09:00",
+      endTime: opts.endTime ?? "13:00",
+      confirmedAt: new Date(),
+    })
+    .returning();
+  await db.update(s.shootRequests).set({ slotId: slot.id }).where(eq(s.shootRequests.id, req.id));
+  return { day, req, slot };
 }
 
 /** A valid spine for an open request — the no-orphan constraint demands one. */

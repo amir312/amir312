@@ -9,11 +9,26 @@ import { createAndSubmitRequest, updateAndResubmitRequest } from "@/lib/services
 import { executeSuggestion } from "@/lib/services/console";
 import { requestPrereqs } from "@/lib/validation/request";
 import { SUGGESTION_KEYS } from "@/lib/workflow/suggestions";
-import { availabilityT, chooseT, console_, errors, shortDate, suppliersT } from "@/lib/i18n/he";
+import {
+  availabilityT,
+  briefT,
+  chooseT,
+  console_,
+  deliverablesT,
+  errors,
+  noteT,
+  shortDate,
+  suppliersT,
+} from "@/lib/i18n/he";
 import { supplierInput } from "@/lib/validation/supplier";
 import { createSupplier, updateSupplier } from "@/lib/services/suppliers";
 import { submitAvailability, verifyAvailabilityToken } from "@/lib/services/availability";
 import { chooseDate, declineDate } from "@/lib/services/matching";
+import { approveBrief, requestBriefChanges, saveBriefDraft, sendBriefToClient } from "@/lib/services/briefs";
+import { confirmT1 } from "@/lib/services/t1";
+import { markShootDoneViaToken, submitDeliverables } from "@/lib/services/deliverables";
+import { db } from "@/db/client";
+import { events } from "@/db/schema";
 
 function str(v: FormDataEntryValue | null): string | undefined {
   const s = typeof v === "string" ? v.trim() : "";
@@ -260,4 +275,191 @@ export async function chooseDateAction(
     return { outcome: "CONFIRMED", date: shortDate(result.date) };
   }
   return { outcome: "DECLINED" };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Phase 4 — brief, T-1, deliverables, manual note
+// ─────────────────────────────────────────────────────────────
+
+export interface BriefEditState {
+  error?: string;
+  message?: string;
+}
+
+export async function saveBriefDraftAction(
+  requestId: string,
+  _prev: BriefEditState,
+  fd: FormData,
+): Promise<BriefEditState> {
+  const user = await currentUser();
+  const content: Record<string, unknown> = {};
+  for (const [key, value] of fd.entries()) {
+    if (typeof value === "string") content[key] = value;
+  }
+  try {
+    await saveBriefDraft(user, requestId, content);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    const known = Object.values(errors).includes(msg);
+    if (!known) console.error("saveBriefDraftAction failed:", err);
+    return { error: known ? msg : errors.actionFailed };
+  }
+  revalidatePath(`/requests/${requestId}`);
+  revalidatePath("/");
+  return { message: briefT.draftSaved };
+}
+
+// Bound with .bind(null, requestId); useActionState's (state, payload) args are unused.
+export async function sendBriefToClientAction(requestId: string): Promise<BriefEditState> {
+  const user = await currentUser();
+  try {
+    await sendBriefToClient(user, requestId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    const known = Object.values(errors).includes(msg);
+    if (!known) console.error("sendBriefToClientAction failed:", err);
+    return { error: known ? msg : errors.actionFailed };
+  }
+  revalidatePath(`/requests/${requestId}`);
+  revalidatePath("/");
+  return { message: briefT.sentToClient };
+}
+
+export interface BriefChoiceState {
+  outcome?: "APPROVED" | "CHANGES";
+  error?: string;
+}
+
+const briefChoiceInput = z.object({
+  token: z.string().min(10),
+  decision: z.enum(["approve", "changes"]),
+  feedback: z.string().max(4000).nullish(),
+});
+
+export async function briefChoiceAction(
+  _prev: BriefChoiceState,
+  fd: FormData,
+): Promise<BriefChoiceState> {
+  // No staff session — the one-shot token is the credential.
+  const parsed = briefChoiceInput.safeParse({
+    token: str(fd.get("token")),
+    decision: str(fd.get("decision")),
+    feedback: str(fd.get("feedback")) ?? null,
+  });
+  if (!parsed.success) return { error: errors.invalidAction };
+  const { token, decision, feedback } = parsed.data;
+
+  try {
+    const result =
+      decision === "approve"
+        ? await approveBrief(token)
+        : await requestBriefChanges(token, feedback ?? "");
+    if (!result.ok) {
+      if (result.reason === "USED") return { error: briefT.alreadyDoneTitle };
+      if (result.reason === "GONE") return { error: briefT.alreadyDoneTitle };
+      return { error: chooseT.invalidTitle };
+    }
+    revalidatePath("/");
+    return { outcome: result.outcome };
+  } catch (err) {
+    console.error("briefChoiceAction failed:", err);
+    return { error: errors.actionFailed };
+  }
+}
+
+export interface T1ActionState {
+  confirmed?: boolean;
+  already?: boolean;
+  error?: string;
+}
+
+export async function t1ConfirmAction(_prev: T1ActionState, fd: FormData): Promise<T1ActionState> {
+  const token = str(fd.get("token"));
+  if (!token) return { error: errors.invalidAction };
+  try {
+    const result = await confirmT1(token);
+    if (!result.ok) return { error: availabilityT.invalidTitle };
+    revalidatePath("/");
+    return { confirmed: true, already: result.already };
+  } catch (err) {
+    console.error("t1ConfirmAction failed:", err);
+    return { error: errors.actionFailed };
+  }
+}
+
+export interface DeliverablesActionState {
+  stage?: "UPLOAD" | "DONE";
+  error?: string;
+}
+
+export async function deliverablesMarkDoneAction(
+  _prev: DeliverablesActionState,
+  fd: FormData,
+): Promise<DeliverablesActionState> {
+  const token = str(fd.get("token"));
+  if (!token) return { error: errors.invalidAction };
+  try {
+    const result = await markShootDoneViaToken(token);
+    if (!result.ok) return { error: availabilityT.invalidTitle };
+    revalidatePath("/");
+    return { stage: "UPLOAD" };
+  } catch (err) {
+    console.error("deliverablesMarkDoneAction failed:", err);
+    return { error: errors.actionFailed };
+  }
+}
+
+export async function deliverablesSubmitAction(
+  _prev: DeliverablesActionState,
+  fd: FormData,
+): Promise<DeliverablesActionState> {
+  const token = str(fd.get("token"));
+  const driveUrl = str(fd.get("driveUrl"));
+  if (!token || !driveUrl) return { error: errors.driveUrlInvalid };
+  try {
+    const result = await submitDeliverables(token, {
+      driveUrl,
+      rawUrl: str(fd.get("rawUrl")) ?? null,
+      note: str(fd.get("note")) ?? null,
+    });
+    if (!result.ok) {
+      if (result.reason === "BAD_URL") return { error: errors.driveUrlInvalid };
+      if (result.reason === "USED" || result.reason === "GONE") {
+        return { error: deliverablesT.alreadySubmitted };
+      }
+      return { error: availabilityT.invalidTitle };
+    }
+    revalidatePath("/");
+    return { stage: "DONE" };
+  } catch (err) {
+    console.error("deliverablesSubmitAction failed:", err);
+    return { error: errors.actionFailed };
+  }
+}
+
+export interface NoteActionState {
+  error?: string;
+  message?: string;
+}
+
+export async function addNoteAction(
+  requestId: string,
+  _prev: NoteActionState,
+  fd: FormData,
+): Promise<NoteActionState> {
+  const user = await currentUser();
+  const text = str(fd.get("note"));
+  if (!text) return { error: errors.noteEmpty };
+  // A manual note is a timeline FACT, not a state change — it goes straight
+  // into the append-only events table with the acting user's attribution.
+  await db().insert(events).values({
+    entityType: "shoot_request",
+    entityId: requestId,
+    kind: "MANUAL_NOTE",
+    actorType: user.role === "COORDINATOR" ? "COORDINATOR" : "SOCIAL_MANAGER",
+    actorId: user.id,
+    summary: text.slice(0, 2000),
+  });
+  revalidatePath(`/requests/${requestId}`);
+  return { message: noteT.added };
 }

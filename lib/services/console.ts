@@ -28,8 +28,10 @@ import { applyTransition, loadRules } from "@/lib/workflow/apply";
 import { RULE } from "@/lib/workflow/rules";
 import { suggestFor, type Suggestion, type SuggestionKey } from "@/lib/workflow/suggestions";
 import type { NextAction, OwnerType, RequestStatus } from "@/lib/workflow/types";
-import { assertOnlyRematchDeferred, executeBookingEffects, expireHold } from "./holds";
+import { assertOnlyRematchDeferred, expireHold } from "./holds";
 import { approveMatch, rematchFreeHalf, resendChooseDateLink, runMatcherForRequest } from "./matching";
+import { forwardAndClose, markShootCompleted, notifyForwarded } from "./deliverables";
+import { resendBriefApprovalLink } from "./briefs";
 
 export interface ExceptionItem {
   shootRequestId: string | null;
@@ -206,9 +208,9 @@ export interface UpcomingSlot {
   halfFree: boolean;
 }
 
-/** Date string (YYYY-MM-DD) as seen in `tz` right now, shifted by n days. */
-export function bizDate(tz: string, offsetDays = 0): string {
-  const d = new Date(Date.now() + offsetDays * 86_400_000);
+/** Date string (YYYY-MM-DD) as seen in `tz` at `base` (default: now), shifted by n days. */
+export function bizDate(tz: string, offsetDays = 0, base = new Date()): string {
+  const d = new Date(base.getTime() + offsetDays * 86_400_000);
   return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 }
 
@@ -346,64 +348,25 @@ export async function executeSuggestion(
       }
 
       case "MARK_SHOT": {
-        await db().transaction(async (tx) => {
-          const requestId = mustRequest(ref);
-          const ctx = await slotContext(tx, requestId);
-          const outcome = await applyTransition(tx, requestId, {
-            kind: "SHOOT_COMPLETED",
-            at,
-            actor: coordinator,
-            supplierId: ctx.supplierId,
-          });
-          await tx
-            .insert(deliverables)
-            .values({
-              shootRequestId: requestId,
-              supplierId: ctx.supplierId,
-              status: "AWAITING_UPLOAD",
-              dueAt: outcome.result.actionDueAt,
-            })
-            .onConflictDoUpdate({
-              target: deliverables.shootRequestId,
-              set: { status: "AWAITING_UPLOAD", dueAt: outcome.result.actionDueAt },
-            });
-        });
+        // Same code path as the photographer's own button — incl. the
+        // per-supplier SLA override.
+        await markShootCompleted(coordinator, mustRequest(ref), at);
         return { ok: true };
       }
 
       case "FORWARD_NOW": {
-        await db().transaction(async (tx) => {
-          const requestId = mustRequest(ref);
-          const [req] = await tx
-            .select({ managed: clients.isSocialManaged })
-            .from(shootRequests)
-            .innerJoin(clients, eq(clients.id, shootRequests.clientId))
-            .where(eq(shootRequests.id, requestId));
-          const forwardedTo = req?.managed ? ("SOCIAL_MANAGER" as const) : ("CLIENT" as const);
-          await applyTransition(tx, requestId, {
-            kind: "DELIVERABLES_FORWARDED",
-            at,
-            actor: coordinator,
-            forwardedTo,
-          });
-          await tx
-            .update(deliverables)
-            .set({ status: "FORWARDED", forwardedAt: at, forwardedTo })
+        const requestId = mustRequest(ref);
+        const result = await db().transaction(async (tx) => {
+          const [d] = await tx
+            .select({ driveUrl: deliverables.driveUrl })
+            .from(deliverables)
             .where(eq(deliverables.shootRequestId, requestId));
-          const closed = await applyTransition(tx, requestId, {
-            kind: "REQUEST_CLOSED",
-            at,
-            actor: { type: "SYSTEM" },
-          });
-          assertOnlyRematchDeferred(
-            await executeBookingEffects(tx, requestId, closed.deferred, at),
-            "FORWARD_NOW",
-          );
-          await tx
-            .update(deliverables)
-            .set({ status: "CLOSED" })
-            .where(eq(deliverables.shootRequestId, requestId));
+          const { forwardedTo } = await forwardAndClose(tx, requestId, at, coordinator);
+          return { forwardedTo, driveUrl: d?.driveUrl ?? null };
         });
+        if (result.driveUrl) {
+          await notifyForwarded(requestId, result.forwardedTo, result.driveUrl);
+        }
         return { ok: true };
       }
 
@@ -447,9 +410,39 @@ export async function executeSuggestion(
         return { ok: true };
       }
 
+      case "REMIND_CLIENT_BRIEF": {
+        // Same principle as the date reminder: deliver a WORKING approval link.
+        const requestId = mustRequest(ref);
+        const rules = await loadRules(db());
+        const windowH = rules.int(RULE.reminderWindowHours);
+        const bucket = Math.floor(at.getTime() / (windowH * 3_600_000));
+        const { recipientName } = await reminderRecipient(key, requestId);
+        const result = await resendBriefApprovalLink(
+          requestId,
+          {
+            idempotencyKey: `rem:${key}:${requestId}:${bucket}`,
+            record: async (tx) => {
+              await tx.insert(events).values({
+                entityType: "shoot_request",
+                entityId: requestId,
+                kind: "MESSAGE_SENT",
+                actorType: "COORDINATOR",
+                actorId: user.id,
+                summary: timelineNotes.reminderSent(recipientName),
+                payload: { template: key },
+                createdAt: at,
+              });
+            },
+          },
+          at,
+        );
+        if (result.status === "DUPLICATE") return { ok: true, message: "DUPLICATE" };
+        if (result.status === "FAILED") return { ok: false, error: errors.actionFailed };
+        return { ok: true };
+      }
+
       case "REMIND_SUBMITTER":
       case "REMIND_BRIEF_OWNER":
-      case "REMIND_CLIENT_BRIEF":
       case "REMIND_SUPPLIER_DELIVERABLES": {
         return sendReminder(user, key, mustRequest(ref), at);
       }

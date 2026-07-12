@@ -392,15 +392,36 @@ async function seed(db: Db): Promise<void> {
     await fire(candidate.id, { kind: "REQUEST_SUBMITTED", at: h(30), actor: asSm(maya.id), submitterId: maya.id });
     await rematchFreeHalf(day.id);
 
-    // A continues to the brief, on time
-    await fire(rA.id, {
+    // A continues to the brief, on time — draft written and already in the
+    // client's hands (CLIENT_REVIEW: the demo target for the approval link).
+    const started = await fire(rA.id, {
       kind: "BRIEF_STARTED",
       at: h(17),
       actor: asSm(maya.id),
       shootDate: date,
       briefOwner: { type: "SOCIAL_MANAGER", id: maya.id },
     });
-    await db.insert(s.briefs).values({ shootRequestId: rA.id, status: "IN_PROGRESS" });
+    const [rABrief] = await db
+      .insert(s.briefs)
+      .values({ shootRequestId: rA.id, status: "CLIENT_REVIEW", dueAt: started.result.actionDueAt })
+      .returning();
+    await db.insert(s.briefVersions).values({
+      briefId: rABrief.id,
+      version: 1,
+      content: {
+        goal: "צילומי לחמים ומאפים לקמפיין החורף ברשתות",
+        shotList: "חזית המאפייה · תקריבי מאפים · הצוות בעבודה · לקוחות בדלפק",
+        products: "לחם מחמצת, קרואסונים, עוגות שמרים",
+        doNotShoot: "אין לצלם את המטבח האחורי",
+      },
+      authorId: maya.id,
+    });
+    await fire(rA.id, {
+      kind: "BRIEF_SENT_TO_CLIENT",
+      at: h(16),
+      actor: asSm(maya.id),
+      approver: { type: "CLIENT", id: bakery.id },
+    });
   }
 
   // ═════ 3. LATE BRIEF — מסעדת הנמל 24, מיכל, יום +2 ═════
@@ -424,14 +445,23 @@ async function seed(db: Db): Promise<void> {
       supplierId: michal.id,
       pairing: soloPairing(day, "TLV", michal.id),
     });
-    await fire(r.id, {
+    const started = await fire(r.id, {
       kind: "BRIEF_STARTED",
       at: d(3),
       actor: asSm(yuval.id),
       shootDate: date,
       briefOwner: { type: "SOCIAL_MANAGER", id: yuval.id },
     });
-    await db.insert(s.briefs).values({ shootRequestId: r.id, status: "IN_PROGRESS" });
+    const [lateBriefRow] = await db
+      .insert(s.briefs)
+      .values({ shootRequestId: r.id, status: "IN_PROGRESS", dueAt: started.result.actionDueAt })
+      .returning();
+    await db.insert(s.briefVersions).values({
+      briefId: lateBriefRow.id,
+      version: 1,
+      content: { goal: "סרטון תדמית למסעדה", script: "פתיח על הנמל, השף מספר על התפריט, מנות בתקריב" },
+      authorId: yuval.id,
+    });
   }
 
   // ═════ 4. UNCONFIRMED T-1 — קליניקת ד"ר רוזן, מיכל, מחר ═════
@@ -463,7 +493,13 @@ async function seed(db: Db): Promise<void> {
       .insert(s.briefs)
       .values({ shootRequestId: r.id, status: "SENT_TO_SUPPLIER", approvedAt: d(2), sentToSupplierAt: d(2) })
       .returning();
-    await db.insert(s.briefVersions).values({ briefId: brief.id, version: 1, content: { goal: "סרטוני הסברה", shotList: ["חדר טיפולים", "קבלה", "ראיון קצר"] }, authorId: yuval.id, isApproved: true });
+    await db.insert(s.briefVersions).values({
+      briefId: brief.id,
+      version: 1,
+      content: { goal: "סרטוני הסברה למטופלים", shotList: "חדר טיפולים · קבלה · ראיון קצר עם ד\"ר רוזן" },
+      authorId: yuval.id,
+      isApproved: true,
+    });
     // The photographer never pressed "דיברתי עם הלקוח"
     await fire(r.id, { kind: "T1_MISSED", at: h(1), actor: system });
   }
