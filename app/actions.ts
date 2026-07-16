@@ -10,6 +10,7 @@ import { executeSuggestion } from "@/lib/services/console";
 import { requestPrereqs } from "@/lib/validation/request";
 import { SUGGESTION_KEYS } from "@/lib/workflow/suggestions";
 import {
+  agentT,
   availabilityT,
   briefT,
   chooseT,
@@ -20,6 +21,8 @@ import {
   shortDate,
   suppliersT,
 } from "@/lib/i18n/he";
+import { hasAgentApiKey, runAgentTurn, type PendingAction } from "@/lib/agent/run";
+import { isApprovalTool, toolByName } from "@/lib/agent/tools";
 import { supplierInput } from "@/lib/validation/supplier";
 import { createSupplier, updateSupplier } from "@/lib/services/suppliers";
 import { submitAvailability, verifyAvailabilityToken } from "@/lib/services/availability";
@@ -434,6 +437,74 @@ export async function deliverablesSubmitAction(
   } catch (err) {
     console.error("deliverablesSubmitAction failed:", err);
     return { error: errors.actionFailed };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Phase 5 — the operational agent
+// ─────────────────────────────────────────────────────────────
+
+export interface AgentChatState {
+  reply?: string;
+  pendingActions?: PendingAction[];
+  toolCalls?: Array<{ name: string; readonly: boolean }>;
+  error?: string;
+}
+
+const chatHistoryInput = z
+  .array(z.object({ role: z.enum(["user", "assistant"]), content: z.string().min(1).max(8000) }))
+  .max(40);
+
+export async function agentChatAction(history: unknown): Promise<AgentChatState> {
+  await currentUser(); // staff-only surface
+  if (!hasAgentApiKey()) return { error: agentT.noKeyBody };
+  const parsed = chatHistoryInput.safeParse(history);
+  if (!parsed.success || parsed.data.length === 0) return { error: errors.invalidAction };
+  try {
+    const result = await runAgentTurn(parsed.data);
+    return {
+      reply: result.reply,
+      pendingActions: result.pendingActions,
+      toolCalls: result.toolCalls,
+    };
+  } catch (err) {
+    console.error("agentChatAction failed:", err);
+    return { error: agentT.errorTurn };
+  }
+}
+
+export interface AgentApprovalState {
+  ok?: boolean;
+  message?: string;
+  error?: string;
+}
+
+/**
+ * THE approval gate (CLAUDE.md invariant 1): the ONLY place an agent-proposed
+ * action executes — after Noam clicked, attributed to her, with the payload
+ * re-validated against the tool's own schema.
+ */
+export async function approveAgentActionAction(
+  toolName: string,
+  input: unknown,
+): Promise<AgentApprovalState> {
+  const user = await currentUser();
+  const tool = toolByName(toolName);
+  if (!tool || !isApprovalTool(tool)) return { ok: false, error: errors.invalidAction };
+  const parsed = tool.schema.safeParse(input);
+  if (!parsed.success) return { ok: false, error: errors.invalidAction };
+  try {
+    const message = await tool.approve(parsed.data, user);
+    revalidatePath("/");
+    return { ok: true, message };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    const known =
+      Object.values(errors).includes(msg) ||
+      msg.includes("לא נמצא לקוח") ||
+      msg === agentT.sendFailed;
+    if (!known) console.error("approveAgentActionAction failed:", err);
+    return { ok: false, error: known ? msg : errors.actionFailed };
   }
 }
 

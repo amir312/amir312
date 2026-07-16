@@ -963,6 +963,50 @@ export async function rematchFreeHalf(dayId: string, now = new Date()): Promise<
   return { candidates: candidates.length };
 }
 
+export interface MatchPreview {
+  requestId: string;
+  clientName: string;
+  candidates: Array<{
+    supplierName: string;
+    date: string;
+    paired: boolean;
+    partnerClientName: string | null;
+    score: number;
+    reason: string;
+  }>;
+}
+
+/**
+ * READ-ONLY matcher run for one request — the agent's eyes, never its hands.
+ * Same world, same pure matcher, zero writes; persisting a proposal stays a
+ * separate, human-approved step.
+ */
+export async function previewMatches(requestId: string, now = new Date()): Promise<MatchPreview> {
+  const { requests, suppliers: sup, openWindows } = await loadMatchables([requestId]);
+  const me = requests.find((r) => r.id === requestId);
+  if (!me) return { requestId, clientName: "", candidates: [] };
+  // The pure matcher pairs only among the requests it is given — load the
+  // full pending pool so pairing candidates are visible, then report ours.
+  const { requests: pool } = await loadMatchables();
+  const rules = await loadRules(db());
+  const outcome = runMatcher(pool, sup, openWindows, rules, now);
+  const byId = new Map(pool.map((r) => [r.id, r.clientName]));
+  const mine = outcome.byRequest.get(requestId) ?? [];
+  const supName = new Map(sup.map((s) => [s.id, s.name]));
+  return {
+    requestId,
+    clientName: me.clientName,
+    candidates: mine.map((c) => ({
+      supplierName: supName.get(c.supplierId) ?? c.supplierId,
+      date: c.date,
+      paired: Boolean(c.pairedWithRequestId),
+      partnerClientName: c.pairedWithRequestId ? (byId.get(c.pairedWithRequestId) ?? null) : null,
+      score: Math.round(c.score),
+      reason: c.reason,
+    })),
+  };
+}
+
 /** Job body: propose matches for everything pending. Idempotent by design. */
 export async function matchAllPending(now = new Date()): Promise<ProposeOutcome> {
   return proposeMatches(now);

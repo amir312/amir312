@@ -98,3 +98,9 @@ test("deliverables upload link renders", async ({ page }, testInfo) => {
   await expect(page.getByRole("button", { name: "מסירת התוצרים" })).toBeVisible();
   await page.screenshot({ path: shotName(testInfo, "deliverables-upload"), fullPage: true });
 });
+
+test("agent page renders", async ({ page }, testInfo) => {
+  await page.goto("/agent");
+  await expect(page.getByRole("heading", { name: "העוזר התפעולי" })).toBeVisible();
+  await page.screenshot({ path: shotName(testInfo, "agent"), fullPage: true });
+});

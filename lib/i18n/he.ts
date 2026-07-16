@@ -645,6 +645,51 @@ export const noteT = {
   added: "ההערה נוספה",
 };
 
+/** The operational agent (/agent): chat, previews, approvals. */
+export const agentT = {
+  title: "העוזר התפעולי",
+  subtitle: "שואלים בעברית חופשית. פעולות שמשנות מצב מוצגות לאישורך — שום דבר לא קורה בלי לחיצה שלך.",
+  placeholder: "למשל: מה תקוע היום? מי הצלמים הפנויים בשרון השבוע?",
+  send: "שליחה",
+  thinking: "חושב…",
+  you: "את",
+  assistant: "העוזר",
+  usedTools: "בדק:",
+  noKeyTitle: "העוזר לא מחובר",
+  noKeyBody: "כדי להפעיל את העוזר יש להגדיר ANTHROPIC_API_KEY בסביבת ההרצה. כל שאר המערכת עובדת כרגיל.",
+  errorTurn: "משהו השתבש בשיחה — נסו שוב",
+  pendingTitle: "ממתין לאישורך",
+  approve: "אשרי — הפעולה תתבצע",
+  deny: "דחי",
+  denied: "נדחה — לא בוצע דבר",
+  approvedToast: "בוצע",
+  refused: "אני לא יכול לעזור בבקשה הזו.",
+  emptyReply: "לא הצלחתי לנסח תשובה — נסו לנסח מחדש",
+  // approval-card content
+  previewDraftMessage: (name: string) => `טיוטת הודעה אל ${name}`,
+  draftedMessageTitle: "הודעה מזאפ דיגיטל",
+  timelineAgentMessage: (name: string) => `נשלחה הודעה אל ${name} (נוסחה על ידי העוזר, אושרה ידנית)`,
+  sendFailed: "השליחה נכשלה — נסו שוב",
+  approvedSent: "ההודעה נשלחה",
+  previewProposeMatch: (name: string) => `הרצת שיבוץ עבור ${name}`,
+  pairedWith: (name: string) => `מזווג עם ${name}`,
+  noCandidates: "לא נמצאו מועמדים כרגע",
+  approvedMatched: (n: number) => `השיבוץ הורץ — ${n} הצעות נרשמו לאישורך במסך הראשי`,
+  previewCreateRequest: (name: string) => `בקשת צילום חדשה — ${name}`,
+  fieldClient: "לקוח",
+  fieldShootType: "סוג צילום",
+  fieldAddress: "כתובת",
+  fieldPurpose: "מטרה",
+  fieldWindow: "חלון תאריכים",
+  clientNotFound: (name: string) => `לא נמצא לקוח בשם "${name}" — בדקו את השם המדויק`,
+  approvedCreated: (result: string) =>
+    result === "PENDING_MATCH"
+      ? "הבקשה נוצרה ונכנסה לתור השיבוץ"
+      : result === "MISSING_INFO"
+        ? "הבקשה נוצרה עם פרטים חסרים — היא ממתינה להשלמה"
+        : "הבקשה נוצרה וממתינה לאישור זכאות",
+};
+
 /** Proposals card on the request page — Noam interrogates the matcher here. */
 export const proposalsT = {
   title: "הצעות שיבוץ",
