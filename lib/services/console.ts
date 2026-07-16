@@ -317,7 +317,7 @@ export async function executeSuggestion(
       }
 
       case "RUN_MATCHER": {
-        const { proposed } = await runMatcherForRequest(mustRequest(ref), at);
+        const { proposed } = await runMatcherForRequest(mustRequest(ref), at, coordinator);
         if (proposed.length === 0) {
           return { ok: false, error: errors.noMatchFound };
         }

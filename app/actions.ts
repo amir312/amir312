@@ -21,8 +21,9 @@ import {
   shortDate,
   suppliersT,
 } from "@/lib/i18n/he";
+import { verifyPendingAction } from "@/lib/agent/approval";
 import { hasAgentApiKey, runAgentTurn, type PendingAction } from "@/lib/agent/run";
-import { isApprovalTool, toolByName } from "@/lib/agent/tools";
+import { AgentUserError, isApprovalTool, toolByName } from "@/lib/agent/tools";
 import { supplierInput } from "@/lib/validation/supplier";
 import { createSupplier, updateSupplier } from "@/lib/services/suppliers";
 import { submitAvailability, verifyAvailabilityToken } from "@/lib/services/availability";
@@ -451,9 +452,18 @@ export interface AgentChatState {
   error?: string;
 }
 
+// Oversize history is CLAMPED, never rejected: one long assistant reply (or
+// message #41) must not brick the conversation until a reload. Keep the last
+// 40 turns, cap each at 8k chars, and drop leading assistant turns so the
+// transcript always opens with the user.
 const chatHistoryInput = z
-  .array(z.object({ role: z.enum(["user", "assistant"]), content: z.string().min(1).max(8000) }))
-  .max(40);
+  .array(z.object({ role: z.enum(["user", "assistant"]), content: z.string().min(1) }))
+  .max(400)
+  .transform((turns) => {
+    const clamped = turns.slice(-40).map((t) => ({ ...t, content: t.content.slice(0, 8000) }));
+    while (clamped.length > 0 && clamped[0].role !== "user") clamped.shift();
+    return clamped;
+  });
 
 export async function agentChatAction(history: unknown): Promise<AgentChatState> {
   await currentUser(); // staff-only surface
@@ -482,29 +492,33 @@ export interface AgentApprovalState {
 /**
  * THE approval gate (CLAUDE.md invariant 1): the ONLY place an agent-proposed
  * action executes — after Noam clicked, attributed to her, with the payload
- * re-validated against the tool's own schema.
+ * re-validated against the tool's own schema AND required to carry the HMAC
+ * minted at preview time. What executes is exactly what was previewed; a
+ * hand-crafted call that never went through a preview card is refused.
  */
 export async function approveAgentActionAction(
   toolName: string,
   input: unknown,
+  signature: string,
 ): Promise<AgentApprovalState> {
   const user = await currentUser();
   const tool = toolByName(toolName);
   if (!tool || !isApprovalTool(tool)) return { ok: false, error: errors.invalidAction };
   const parsed = tool.schema.safeParse(input);
   if (!parsed.success) return { ok: false, error: errors.invalidAction };
+  if (!verifyPendingAction(toolName, parsed.data, signature)) {
+    return { ok: false, error: agentT.approvalStale };
+  }
   try {
     const message = await tool.approve(parsed.data, user);
     revalidatePath("/");
     return { ok: true, message };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "";
-    const known =
-      Object.values(errors).includes(msg) ||
-      msg.includes("לא נמצא לקוח") ||
-      msg === agentT.sendFailed;
-    if (!known) console.error("approveAgentActionAction failed:", err);
-    return { ok: false, error: known ? msg : errors.actionFailed };
+    // AgentUserError messages are Hebrew strings meant for Noam; anything
+    // else is an internal failure — log it, show the generic line.
+    if (err instanceof AgentUserError) return { ok: false, error: err.message };
+    console.error("approveAgentActionAction failed:", err);
+    return { ok: false, error: errors.actionFailed };
   }
 }
 

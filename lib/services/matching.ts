@@ -171,6 +171,7 @@ export interface ProposeOutcome {
 export async function proposeMatches(
   now = new Date(),
   requestFilter?: string[],
+  actor: Actor = { type: "SYSTEM" },
 ): Promise<ProposeOutcome> {
   const { requests, suppliers: sup, openWindows } = await loadMatchables(requestFilter);
   if (requests.length === 0) return { proposed: [] };
@@ -323,7 +324,7 @@ export async function proposeMatches(
           const outcome = await applyTransition(tx, id, {
             kind: "MATCH_PROPOSED",
             at: now,
-            actor: { type: "SYSTEM" },
+            actor,
             paired: Boolean(partnerId),
             proposalCount: 1,
           });
@@ -982,12 +983,11 @@ export interface MatchPreview {
  * separate, human-approved step.
  */
 export async function previewMatches(requestId: string, now = new Date()): Promise<MatchPreview> {
-  const { requests, suppliers: sup, openWindows } = await loadMatchables([requestId]);
-  const me = requests.find((r) => r.id === requestId);
+  // ONE full load: the pure matcher pairs only among the requests it is
+  // given, so the whole pending pool is needed anyway — ours included.
+  const { requests: pool, suppliers: sup, openWindows } = await loadMatchables();
+  const me = pool.find((r) => r.id === requestId);
   if (!me) return { requestId, clientName: "", candidates: [] };
-  // The pure matcher pairs only among the requests it is given — load the
-  // full pending pool so pairing candidates are visible, then report ours.
-  const { requests: pool } = await loadMatchables();
   const rules = await loadRules(db());
   const outcome = runMatcher(pool, sup, openWindows, rules, now);
   const byId = new Map(pool.map((r) => [r.id, r.clientName]));
@@ -1012,9 +1012,13 @@ export async function matchAllPending(now = new Date()): Promise<ProposeOutcome>
   return proposeMatches(now);
 }
 
-/** One-request trigger for the console's "הרץ שיבוץ" button. */
-export async function runMatcherForRequest(requestId: string, now = new Date()): Promise<ProposeOutcome> {
-  return proposeMatches(now, [requestId]);
+/** One-request trigger for the console's "הרץ שיבוץ" button and the agent's approved propose_match — the clicking human is the actor on the MATCH_PROPOSED event. */
+export async function runMatcherForRequest(
+  requestId: string,
+  now = new Date(),
+  actor: Actor = { type: "SYSTEM" },
+): Promise<ProposeOutcome> {
+  return proposeMatches(now, [requestId], actor);
 }
 
 export { chooseT };

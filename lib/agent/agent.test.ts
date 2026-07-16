@@ -18,7 +18,6 @@ import { createTestDb, type TestDb } from "@/db/test/harness";
 let t: TestDb;
 let tools: typeof import("./tools");
 let run: typeof import("./run");
-let matching: typeof import("@/lib/services/matching");
 
 let sm: Awaited<ReturnType<typeof seedUser>>;
 let noam: Awaited<ReturnType<typeof seedUser>>;
@@ -34,26 +33,25 @@ function futureDate(daysAhead: number): string {
   );
 }
 
-/** Row counts across every state-bearing table — the "nothing was written" proof. */
-async function stateSnapshot(): Promise<Record<string, number>> {
-  const tables = [
-    "shoot_requests",
-    "events",
-    "slot_proposals",
-    "supplier_days",
-    "shoot_slots",
-    "supplier_availability",
-    "notifications",
-    "access_tokens",
-    "entitlement_events",
-    "incidents",
-    "briefs",
-    "deliverables",
-  ];
-  const out: Record<string, number> = {};
+/**
+ * A content HASH of EVERY table in the schema — the "nothing was written"
+ * proof. Row hashes (not counts) catch in-place UPDATEs too, and deriving the
+ * table list from the catalog means a new table can never silently escape it.
+ */
+async function stateSnapshot(): Promise<Record<string, string>> {
+  const tablesResult = await t.db.execute(
+    sql.raw(`select tablename from pg_tables where schemaname = 'public' order by tablename`),
+  );
+  const tables = (tablesResult as unknown as Array<{ tablename: string }>).map((r) => r.tablename);
+  expect(tables.length).toBeGreaterThanOrEqual(15);
+  const out: Record<string, string> = {};
   for (const table of tables) {
-    const rows = await t.db.execute(sql.raw(`select count(*)::int as n from ${table}`));
-    out[table] = (rows as unknown as Array<{ n: number }>)[0].n;
+    const rows = await t.db.execute(
+      sql.raw(
+        `select coalesce(md5(string_agg(md5(t::text), '' order by md5(t::text))), 'empty') as h from "${table}" t`,
+      ),
+    );
+    out[table] = (rows as unknown as Array<{ h: string }>)[0].h;
   }
   return out;
 }
@@ -64,7 +62,6 @@ beforeAll(async () => {
   process.env.APP_ORIGIN = "https://ops.test";
   tools = await import("./tools");
   run = await import("./run");
-  matching = await import("@/lib/services/matching");
 
   sm = await seedUser(t.db);
   noam = await seedUser(t.db, { role: "COORDINATOR", name: "נועם" });
@@ -294,6 +291,39 @@ describe("the agent loop", () => {
     expect(result.reply.length).toBeGreaterThan(0);
     expect(result.pendingActions).toEqual([]);
   });
+
+  it("signs the pending action; the signature survives the client round-trip but dies on tampering", async () => {
+    const approval = await import("./approval");
+    const draftInput = {
+      recipientKind: "SUPPLIER",
+      recipientName: "צלם הסוכן",
+      body: "הודעה לבדיקת חתימה — חמש מילים לפחות.",
+    };
+    const scripted = scriptedClient([
+      fakeMessage([toolUseBlock("draft_message", draftInput)], "tool_use"),
+      fakeMessage([textBlock("ממתין לאישור.")], "end_turn"),
+    ]);
+    const result = await run.runAgentTurn([{ role: "user", content: "שלחי" }], {
+      client: scripted.client,
+    });
+    const action = result.pendingActions[0];
+    expect(action.signature.length).toBeGreaterThan(20);
+
+    // what the approval endpoint does: JSON round-trip (the server-action
+    // boundary), re-parse against the tool schema, then verify
+    const tool = tools.toolByName(action.toolName);
+    if (!tool || !tools.isApprovalTool(tool)) throw new Error("missing tool");
+    const reparsed = tool.schema.parse(JSON.parse(JSON.stringify(action.input)));
+    expect(approval.verifyPendingAction(action.toolName, reparsed, action.signature)).toBe(true);
+
+    // tampered payload (a different message body) must NOT verify
+    const tampered = tool.schema.parse({ ...(action.input as object), body: "טקסט אחר לגמרי — חמש מילים." });
+    expect(approval.verifyPendingAction(action.toolName, tampered, action.signature)).toBe(false);
+    // a different tool must not accept the same payload+signature
+    expect(approval.verifyPendingAction("propose_match", reparsed, action.signature)).toBe(false);
+    // garbage signature is rejected, not thrown
+    expect(approval.verifyPendingAction(action.toolName, reparsed, "not-a-signature")).toBe(false);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -336,6 +366,18 @@ describe("approve()", () => {
       .from(s.notifications)
       .where(eq(s.notifications.template, "agent_drafted_message"));
     expect(notesAfter).toHaveLength(1);
+
+    // an unknown recipient is a Hebrew error — NEVER "use the name as address"
+    await expect(
+      tool.approve(
+        tool.schema.parse({
+          recipientKind: "SUPPLIER",
+          recipientName: "צלם שלא קיים",
+          body: "הודעה שלא אמורה להישלח לעולם.",
+        }),
+        noam,
+      ),
+    ).rejects.toThrow(/לא נמצא איש קשר/);
   });
 
   it("propose_match: preview persists NOTHING; approve runs the real matcher", async () => {

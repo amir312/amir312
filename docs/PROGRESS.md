@@ -380,3 +380,88 @@ fixed and re-verified, including its live concurrency probes re-covered as regre
 5. Deliverables auto-forward targets the social manager for managed clients, the client
    otherwise; the drive URL also renders on the request page, so a failed notification (P4-3)
    degrades to "visible in the console", never "lost".
+
+---
+
+## Phase 5 — The operational agent. Only now.
+
+**Built:**
+- `lib/agent/tools/index.ts` — the typed tool surface, CLAUDE.md invariant 1 in code: every
+  tool is `readonly: true` XOR `requiresApproval: true` (registry test enforces the XOR, the
+  exact 8-tool surface, unique names, and JSON-Schema convertibility). Read-only:
+  `get_exceptions`, `find_pairing_candidates` (matcher run, zero writes), `get_supplier_availability`,
+  `summarize_timeline`, `get_overdue_deliverables` — same service layer as the UI. Approval:
+  `draft_message`, `propose_match`, `create_request_from_text` — each renders a full Hebrew
+  preview card (every schema field on the card: recipient + kind, full body, linked request
+  by name, notes, Hebrew shoot-type label — never an enum, never a UUID) and executes ONLY
+  from the approval endpoint, attributed to the human who clicked (propose_match stamps the
+  coordinator as the MATCH_PROPOSED actor — console RUN_MATCHER now does the same).
+- `lib/agent/run.ts` — a deliberate MANUAL tool loop over the Messages API (`claude-opus-4-8`,
+  adaptive thinking, `z.toJSONSchema` tool schemas): readonly tools execute; approval tools
+  yield a preview card + a `PENDING_APPROVAL` tool_result — the loop physically contains no
+  call to `approve()`. Refusal stop → safe Hebrew line; loop-budget exhaustion and
+  `max_tokens` truncation append a visible "⏸ עצרתי באמצע" notice — a cut-off never reads
+  like a finished answer. Injectable `ModelClient` = deterministic offline tests.
+- `lib/agent/approval.ts` — what Noam SAW is what executes: every pending action carries an
+  HMAC-SHA256 over (toolName, schema-canonical input), minted only inside the loop at preview
+  time; `approveAgentActionAction` re-validates against the tool schema AND refuses any
+  payload whose signature does not verify (constant-time). A mutated payload, a stale card
+  after restart, or a direct call that never went through a preview → Hebrew error, zero
+  execution. `AgentUserError` separates operator-facing Hebrew errors from internal failures.
+- `app/agent` + `components/agent-chat.tsx` — Hebrew RTL chat: what the agent checked
+  ("בדק: …"), amber approval cards with אשרי/דחי, denial is local (nothing to undo — nothing
+  ran), "שיחה חדשה" reset; oversize history is CLAMPED server-side (last 40 turns / 8k chars,
+  leading assistant turns dropped), so a long reply can never brick the conversation. No-key
+  mode degrades honestly (העוזר לא מחובר) — the rest of the system is untouched.
+- `lib/agent/agent.test.ts` — the invariant proven against real Postgres: readonly tools run
+  while a content HASH of EVERY public table (derived from pg_tables, md5 row-agg — catches
+  in-place UPDATEs and can never miss a new table) stays identical; the loop never executes
+  an approval tool (preview out, PENDING_APPROVAL in, snapshot unchanged); approve() is the
+  only writer, attributed to Noam, idempotent on double-click (content-derived idempotency
+  key); unknown recipient/client are Hebrew errors — never "use the name as the address";
+  signature round-trips the client boundary, dies on tampering/cross-tool replay/garbage.
+
+**Acceptance (BUILD-PROMPT Phase 5):**
+
+| criterion | result |
+| --- | --- |
+| exactly the named surface: 5 read-only + 3 requires-approval tools | **PASS** (test-enforced) |
+| tools call the service layer, never write the database directly | **PASS** (approve paths: sendNotification / runMatcherForRequest / createAndSubmitRequest; timeline rows via the notify `record` hook, same precedent as manual notes) |
+| every state-changing action is a preview + approve button — always, no exception | **PASS** (loop cannot execute approval tools; endpoint refuses unsigned/unpreviewed payloads) |
+| `pnpm typecheck && lint && test && build` | **PASS** — 163 tests, 17 files; e2e 40/40 (desktop + 390px) |
+
+**Reviewer findings and fixes** (fresh-context adversarial subagent, verdict FIX-FIRST; all
+11 findings fixed, gates re-run green):
+
+| # | severity | finding | resolution |
+| --- | --- | --- | --- |
+| P5-1 | BLOCKER | `pnpm lint` failed (unused test variable) — DoD step 15 red as shipped | removed; lint green |
+| P5-2 | MAJOR | the approval endpoint executed any schema-valid `(toolName, input)` — the preview `id` was decorative, so a payload mutated between render and click (or one that never had a preview) would run; `resolveRecipient` fell back `?? name`, turning an unknown recipient into an address | pending actions are HMAC-signed at preview (`lib/agent/approval.ts`); the endpoint verifies before executing — no signature, no execution; the `?? name` fallback removed: unknown recipient/client → Hebrew `AgentUserError` |
+| P5-3 | MAJOR | `create_request_from_text` preview hid `notes` (persisted but never shown — the exact prompt-injection hole the card exists to close); `draft_message` omitted `recipientKind`/`requestId`, and approve never checked the request exists (hallucinated UUID → MESSAGE_SENT row on the wrong timeline) | every schema field renders on the card (notes, recipient + kind, linked request as "client — purpose"); approve validates `requestId` existence with a Hebrew error |
+| P5-4 | MINOR | raw `STILLS`/`VIDEO` enum on a human-facing card | Hebrew label from `form.shootTypes` |
+| P5-5 | MINOR | one long assistant reply (>8k chars) or message #41 failed history validation FOREVER — conversation bricked until reload, no reset | history clamped server-side instead of rejected (last 40 / 8k each, leading assistant turns dropped); "שיחה חדשה" button added |
+| P5-6 | MINOR | the "readonly writes nothing" proof counted rows in 12 hard-coded tables — blind to UPDATEs and to the 5 missing tables | snapshot = md5 content hash of EVERY table, list derived live from `pg_tables` |
+| P5-7 | MINOR | inline-Hebrew string matching classified approval errors — rewording an i18n string would silently degrade real errors to the generic line | typed `AgentUserError`; `instanceof` decides what Noam sees |
+| P5-8 | MINOR | loop-budget exhaustion / max_tokens truncation were silent — a cut-off read like a finished answer | `lastStopReason` appends a visible Hebrew notice for both exits |
+| P5-9 | NIT | history shape allowed an assistant-first transcript | leading non-user turns dropped in the same clamp |
+| P5-10 | NIT | raw UUID in the propose_match card title when the request is unmatchable; `previewMatches` loaded the pool twice | Hebrew "בקשה לא מזוהה" fallback; single full-pool load |
+| P5-11 | NIT | propose_match approval recorded actor SYSTEM — the clicking human left no trace (console parity, but the attribution claim didn't hold) | `Actor` threaded through `proposeMatches`/`runMatcherForRequest`; both the agent approval AND the console RUN_MATCHER now stamp the coordinator |
+
+**Decisions the spec did not dictate:**
+1. Approval-binding is an HMAC over the schema-parsed payload, not a server-side pending-
+   actions table: nothing to store, nothing to expire, and the semantics are exactly right —
+   "this exact payload was previewed by the loop". A restart voids open cards with a clear
+   Hebrew line ("כרטיס האישור הזה כבר לא תקף"); Noam asks again. `AGENT_APPROVAL_SECRET`
+   makes it multi-instance-safe when that day comes.
+2. The tool loop is manual, not the SDK runner — approval tools must never execute in-loop,
+   and a fake `ModelClient` makes every loop path testable offline. `max_tokens` 16000,
+   8-iteration budget, both cut-offs visible.
+3. Deny is client-side only: a denied card executed nothing, so there is nothing to record —
+   no phantom "action denied" events on the timeline.
+4. Read-only tools may SELECT via drizzle directly (same as server components); the WRITE
+   path is where the service-layer rule is absolute — all three approve() paths go through
+   services, and the snapshot test would catch any regression.
+5. The agent stays OUT of the state machine: no tool can transition a request, place a hold,
+   or consume an entitlement even WITH approval — the three approval tools are message-send,
+   matcher-run (proposals for Noam's review), and intake-create (which routes through the
+   same validation as the form). The riskiest primitives simply do not exist on this surface.

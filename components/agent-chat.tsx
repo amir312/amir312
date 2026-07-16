@@ -28,7 +28,7 @@ function ApprovalCard({ action }: { action: PendingAction }) {
 
   async function approve() {
     setState("working");
-    const result = await approveAgentActionAction(action.toolName, action.input);
+    const result = await approveAgentActionAction(action.toolName, action.input, action.signature);
     if (result.ok) {
       setState("done");
       setMessage(result.message ?? agentT.approvedToast);
@@ -161,6 +161,19 @@ export function AgentChat() {
         <Button type="submit" disabled={pending || input.trim() === ""}>
           {agentT.send}
         </Button>
+        {messages.length > 0 ? (
+          <Button
+            type="button"
+            variant="outline"
+            disabled={pending}
+            onClick={() => {
+              setMessages([]);
+              setError(null);
+            }}
+          >
+            {agentT.newChat}
+          </Button>
+        ) : null}
       </form>
     </div>
   );

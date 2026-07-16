@@ -15,7 +15,7 @@ import { z } from "zod";
 import { and, desc, eq, gte, inArray } from "drizzle-orm";
 import { db } from "@/db/client";
 import { clients, deliverables, events, shootRequests, supplierAvailability, suppliers } from "@/db/schema";
-import { agentT } from "@/lib/i18n/he";
+import { agentT, form, ownerLabels } from "@/lib/i18n/he";
 import { getExceptions, bizDate, getTimezone } from "@/lib/services/console";
 import { previewMatches, runMatcherForRequest } from "@/lib/services/matching";
 import { createAndSubmitRequest } from "@/lib/services/requests";
@@ -49,6 +49,18 @@ export interface ApprovalTool<Schema extends z.ZodType = z.ZodType> extends Base
 }
 
 export type AgentTool = ReadonlyTool | ApprovalTool;
+
+/**
+ * An error whose message is safe (and meant) to show Noam verbatim — always
+ * a Hebrew string from lib/i18n/he.ts. Anything else is logged and replaced
+ * with the generic Hebrew failure line.
+ */
+export class AgentUserError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AgentUserError";
+  }
+}
 
 /** Constructor helpers: schema-typed inference + the discriminant, in one place. */
 function readonlyTool<S extends z.ZodType>(t: Omit<ReadonlyTool<S>, "readonly">): ReadonlyTool<S> {
@@ -211,16 +223,29 @@ const draftMessageSchema = z.object({
 const draftMessageTool = approvalTool({
   name: "draft_message",
   description:
-    "Call this when Noam asks you to write/send a message, reminder, or update to a client, photographer, or social manager. You DRAFT the text; the message is sent only after Noam approves the preview.",
+    "Call this when Noam asks you to write/send a message, reminder, or update to a client, photographer, or social manager. You DRAFT the text; the message is sent only after Noam approves the preview. The recipient must exist in the system by that exact name.",
   schema: draftMessageSchema,
   async preview(input) {
-    return {
-      title: agentT.previewDraftMessage(input.recipientName),
-      details: [input.body],
-    };
+    // The card shows EVERYTHING that will happen — recipient (and what kind
+    // of contact they are), the full text, and the timeline it will land on.
+    const details = [
+      `${agentT.fieldRecipient}: ${input.recipientName} (${ownerLabels[input.recipientKind]})`,
+      input.body,
+    ];
+    if (input.requestId) {
+      details.push(`${agentT.fieldLinkedRequest}: ${await requestLabel(input.requestId)}`);
+    }
+    return { title: agentT.previewDraftMessage(input.recipientName), details };
   },
   async approve(input, approver) {
     const recipient = await resolveRecipient(input.recipientKind, input.recipientName);
+    if (input.requestId) {
+      const [exists] = await db()
+        .select({ id: shootRequests.id })
+        .from(shootRequests)
+        .where(eq(shootRequests.id, input.requestId));
+      if (!exists) throw new AgentUserError(agentT.requestNotFound);
+    }
     // Key derived from the content: a double-clicked approval of the SAME
     // draft cannot send twice; a different draft always goes out.
     const { hashToken } = await import("@/lib/tokens");
@@ -251,26 +276,45 @@ const draftMessageTool = approvalTool({
         },
       },
     );
-    if (result.status === "FAILED") throw new Error(agentT.sendFailed);
+    if (result.status === "FAILED") throw new AgentUserError(agentT.sendFailed);
     return agentT.approvedSent;
   },
 });
 
+/** "Client name · short context" for a request id on a human-facing card. */
+async function requestLabel(requestId: string): Promise<string> {
+  const [row] = await db()
+    .select({ clientName: clients.name, purpose: shootRequests.purpose })
+    .from(shootRequests)
+    .innerJoin(clients, eq(clients.id, shootRequests.clientId))
+    .where(eq(shootRequests.id, requestId));
+  if (!row) return agentT.requestNotFound;
+  return row.purpose ? `${row.clientName} — ${row.purpose}` : row.clientName;
+}
+
+/**
+ * A recipient must RESOLVE to a known contact. There is deliberately no
+ * "use the name as the address" fallback — an unknown name is a Hebrew
+ * error, never an arbitrary send target.
+ */
 async function resolveRecipient(
   kind: "CLIENT" | "SUPPLIER" | "SOCIAL_MANAGER",
   name: string,
 ): Promise<string> {
   if (kind === "SUPPLIER") {
-    const [s] = await db().select({ phone: suppliers.phone }).from(suppliers).where(eq(suppliers.name, name));
-    return s?.phone ?? name;
+    const [s] = await db().select({ name: suppliers.name, phone: suppliers.phone }).from(suppliers).where(eq(suppliers.name, name));
+    if (!s) throw new AgentUserError(agentT.recipientNotFound(name));
+    return s.phone ?? s.name;
   }
   if (kind === "CLIENT") {
-    const [c] = await db().select({ phone: clients.contactPhone }).from(clients).where(eq(clients.name, name));
-    return c?.phone ?? name;
+    const [c] = await db().select({ name: clients.name, phone: clients.contactPhone }).from(clients).where(eq(clients.name, name));
+    if (!c) throw new AgentUserError(agentT.recipientNotFound(name));
+    return c.phone ?? c.name;
   }
   const { users } = await import("@/db/schema");
   const [u] = await db().select({ email: users.email }).from(users).where(eq(users.name, name));
-  return u?.email ?? name;
+  if (!u) throw new AgentUserError(agentT.recipientNotFound(name));
+  return u.email;
 }
 
 const proposeMatchSchema = z.object({
@@ -285,7 +329,8 @@ const proposeMatchTool = approvalTool({
   async preview(input) {
     const preview = await previewMatches(input.requestId);
     return {
-      title: agentT.previewProposeMatch(preview.clientName || input.requestId),
+      // an unmatchable request gets a Hebrew label, never a raw UUID
+      title: agentT.previewProposeMatch(preview.clientName || agentT.unknownRequest),
       details:
         preview.candidates.length > 0
           ? preview.candidates.map(
@@ -294,8 +339,11 @@ const proposeMatchTool = approvalTool({
           : [agentT.noCandidates],
     };
   },
-  async approve(input) {
-    const { proposed } = await runMatcherForRequest(input.requestId);
+  async approve(input, approver) {
+    const { proposed } = await runMatcherForRequest(input.requestId, new Date(), {
+      type: "COORDINATOR",
+      id: approver.id,
+    });
     return proposed.length > 0 ? agentT.approvedMatched(proposed.length) : agentT.noCandidates;
   },
 });
@@ -316,20 +364,23 @@ const createRequestTool = approvalTool({
     "Call this when Noam pastes or dictates a new shoot request in free text (an email, a WhatsApp message). Extract the fields; the request is created only after she approves the preview. Missing fields are fine — intake will route it as MISSING_INFO.",
   schema: createRequestSchema,
   async preview(input) {
+    // Everything extracted from the free text is ON the card — Noam approves
+    // what she can read, in Hebrew, never a raw enum.
     const details = [
       `${agentT.fieldClient}: ${input.clientName}`,
-      `${agentT.fieldShootType}: ${input.shootType}`,
+      `${agentT.fieldShootType}: ${form.shootTypes[input.shootType] ?? input.shootType}`,
     ];
     if (input.address) details.push(`${agentT.fieldAddress}: ${input.address}`);
     if (input.purpose) details.push(`${agentT.fieldPurpose}: ${input.purpose}`);
     if (input.windowFrom || input.windowTo) {
       details.push(`${agentT.fieldWindow}: ${input.windowFrom ?? "?"} — ${input.windowTo ?? "?"}`);
     }
+    if (input.notes) details.push(`${agentT.fieldNotes}: ${input.notes}`);
     return { title: agentT.previewCreateRequest(input.clientName), details };
   },
   async approve(input, approver) {
     const [client] = await db().select().from(clients).where(eq(clients.name, input.clientName));
-    if (!client) throw new Error(agentT.clientNotFound(input.clientName));
+    if (!client) throw new AgentUserError(agentT.clientNotFound(input.clientName));
     const outcome = await createAndSubmitRequest(
       approver.id,
       { clientId: client.id, shootType: input.shootType },

@@ -13,6 +13,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { agentT } from "@/lib/i18n/he";
+import { signPendingAction } from "./approval";
 import { AGENT_TOOLS, isApprovalTool, isReadonlyTool, toolByName } from "./tools";
 
 export const AGENT_MODEL = process.env.AGENT_MODEL ?? "claude-opus-4-8";
@@ -38,11 +39,14 @@ export interface ChatTurn {
 }
 
 export interface PendingAction {
-  /** Client-side handle for the approve button round-trip. */
+  /** Client-side handle for React keys. */
   id: string;
   toolName: string;
   /** The validated tool input — re-validated server-side on approval. */
   input: unknown;
+  /** HMAC binding this exact (toolName, input) to the preview that was shown.
+   *  The approval endpoint executes NOTHING without a verifying signature. */
+  signature: string;
   title: string;
   details: string[];
 }
@@ -90,6 +94,7 @@ export async function runAgentTurn(
   const pendingActions: PendingAction[] = [];
   const toolCalls: AgentTurnResult["toolCalls"] = [];
   let reply = "";
+  let lastStopReason: Anthropic.Message["stop_reason"] = null;
 
   for (let i = 0; i < MAX_LOOP_ITERATIONS; i++) {
     const response = await client.create({
@@ -100,6 +105,7 @@ export async function runAgentTurn(
       tools: toApiTools(),
       messages,
     });
+    lastStopReason = response.stop_reason;
 
     if (response.stop_reason === "refusal") {
       return { reply: agentT.refused, pendingActions, toolCalls };
@@ -122,7 +128,12 @@ export async function runAgentTurn(
     messages.push({ role: "user", content: results });
   }
 
-  return { reply: reply || agentT.emptyReply, pendingActions, toolCalls };
+  // Cut-offs must be VISIBLE, never silent: an exhausted tool budget or a
+  // max_tokens truncation reads very differently from a finished answer.
+  let finalReply = reply || agentT.emptyReply;
+  if (lastStopReason === "tool_use") finalReply = `${finalReply}\n\n${agentT.loopBudgetNote}`;
+  if (lastStopReason === "max_tokens") finalReply = `${finalReply}\n\n${agentT.truncatedNote}`;
+  return { reply: finalReply, pendingActions, toolCalls };
 }
 
 async function runOneTool(
@@ -167,6 +178,7 @@ async function runOneTool(
         id: randomUUID(),
         toolName: tool.name,
         input: parsed.data,
+        signature: signPendingAction(tool.name, parsed.data),
         title: preview.title,
         details: preview.details,
       });
