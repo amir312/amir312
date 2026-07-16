@@ -333,10 +333,17 @@ create table brief_versions (
 );
 
 -- An APPROVED brief version is immutable — the photographer must see exactly
--- what the client approved. Approving (false→true, nothing else changing) is
--- the one permitted update; feedback lands on unapproved versions only.
+-- what the client approved. A version is BORN a draft (insert with
+-- is_approved is rejected); approving it (false→true, nothing else changing)
+-- is the one permitted update; feedback lands on unapproved versions only.
 create function forbid_approved_brief_mutation() returns trigger language plpgsql as $$
 begin
+  if tg_op = 'INSERT' then
+    if new.is_approved then
+      raise exception 'a brief version is born a draft — approval is a separate audited flip';
+    end if;
+    return new;
+  end if;
   if old.is_approved then
     raise exception 'brief version % is approved and immutable', old.id;
   end if;
@@ -354,8 +361,13 @@ begin
 end $$;
 
 create trigger brief_versions_approved_immutable
-  before update or delete on brief_versions
+  before insert or update or delete on brief_versions
   for each row execute function forbid_approved_brief_mutation();
+
+-- Exactly one approved version per brief — what the photographer sees is
+-- singular, at the database layer, not by query convention.
+create unique index brief_versions_single_approved
+  on brief_versions (brief_id) where is_approved;
 
 -- ─────────────────────────────────────────────────────────────
 -- Deliverables — a link + metadata. We do not host raw footage.

@@ -6,6 +6,7 @@ import { db } from "@/db/client";
 import { availabilityT, briefT, deliverablesT, shortDate, t1T } from "@/lib/i18n/he";
 import { getAvailabilityPage, verifyAvailabilityToken } from "@/lib/services/availability";
 import { getSupplierBriefView } from "@/lib/services/briefs";
+import { getTimezone } from "@/lib/services/console";
 import { getDeliverablesPage } from "@/lib/services/deliverables";
 import { getT1Page } from "@/lib/services/t1";
 import { peekTokenPurpose } from "@/lib/tokens";
@@ -93,7 +94,7 @@ async function DeliverablesPage({ token }: { token: string }) {
     ? new Intl.DateTimeFormat("he-IL", {
         day: "numeric",
         month: "numeric",
-        timeZone: "Asia/Jerusalem",
+        timeZone: await getTimezone(),
       }).format(page.dueAt)
     : shortDate(page.shootDate);
   return (

@@ -30,6 +30,16 @@ import { bizDate } from "./console";
 
 const appOrigin = () => process.env.APP_ORIGIN ?? "http://localhost:3000";
 
+/**
+ * Upload-link TTL: the SLA window with generous operational margin (late
+ * deliveries must still work through the same link). A margin, not a business
+ * rule — the binding deadline comes from the transition. Shared with
+ * db/dev-token.ts so dev links behave like real ones.
+ */
+export function uploadLinkExpiry(now: Date, slaDays: number, graceHours: number): Date {
+  return addHours(now, slaDays * 24 * 3 + graceHours + 7 * 24);
+}
+
 /** A plausible external-storage URL — https and a host. Nothing more. */
 export function isPlausibleUrl(raw: string): boolean {
   try {
@@ -156,7 +166,7 @@ export async function notifyForwarded(
   requestId: string,
   forwardedTo: "SOCIAL_MANAGER" | "CLIENT",
   driveUrl: string,
-): Promise<void> {
+): Promise<"SENT" | "DUPLICATE" | "FAILED" | "SKIPPED"> {
   const [row] = await db()
     .select({
       clientName: clients.name,
@@ -166,7 +176,7 @@ export async function notifyForwarded(
     .from(shootRequests)
     .innerJoin(clients, eq(clients.id, shootRequests.clientId))
     .where(eq(shootRequests.id, requestId));
-  if (!row) return;
+  if (!row) return "SKIPPED";
   let recipient = row.clientPhone ?? row.clientName;
   let recipientName = row.clientName;
   if (forwardedTo === "SOCIAL_MANAGER" && row.smId) {
@@ -179,7 +189,8 @@ export async function notifyForwarded(
       recipientName = sm.name;
     }
   }
-  await sendNotification(db(), {
+  // A stable key: a FAILED send is retried on the SAME row by the sweep.
+  const result = await sendNotification(db(), {
     template: "deliverables_forwarded",
     recipient,
     title: notifyTemplates.deliverablesForwarded.title,
@@ -189,6 +200,41 @@ export async function notifyForwarded(
     entityId: requestId,
     idempotencyKey: `forwarded:${requestId}`,
   });
+  return result.status;
+}
+
+/**
+ * Sweep half: re-attempt FAILED forward notifications. The request is already
+ * COMPLETED (terminal, invisible in the console), so without this the drive
+ * link would silently never reach the social manager.
+ */
+export async function retryFailedForwards(): Promise<{ retried: string[] }> {
+  const failed = await db()
+    .select({ entityId: notifications.entityId })
+    .from(notifications)
+    .where(
+      and(eq(notifications.template, "deliverables_forwarded"), eq(notifications.status, "FAILED")),
+    );
+  const retried: string[] = [];
+  for (const { entityId } of failed) {
+    if (!entityId) continue;
+    try {
+      const [d] = await db()
+        .select({ driveUrl: deliverables.driveUrl, forwardedTo: deliverables.forwardedTo })
+        .from(deliverables)
+        .where(eq(deliverables.shootRequestId, entityId));
+      if (!d?.driveUrl || !d.forwardedTo) continue;
+      const status = await notifyForwarded(
+        entityId,
+        d.forwardedTo as "SOCIAL_MANAGER" | "CLIENT",
+        d.driveUrl,
+      );
+      if (status === "SENT") retried.push(entityId);
+    } catch (err) {
+      console.error(`retryFailedForwards: ${entityId}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  return { retried };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -197,14 +243,17 @@ export async function notifyForwarded(
 
 /**
  * End-of-shoot-day sweep (job body): every photographer whose shoot happened
- * today gets the deliverables link. Idempotent per request per date.
+ * today — or YESTERDAY, if the evening runs were down or landed FAILED —
+ * gets the deliverables link. Idempotent per request per shoot date.
  */
 export async function sendUploadLinks(now = new Date()): Promise<{ sent: string[] }> {
   const rules = await loadRules(db());
   const tz = rules.string(RULE.timezone);
   const today = bizDate(tz, 0, now);
   const endOfDay = dateAtHourInTz(today, rules.int(RULE.shootDayEndHour), tz);
-  if (now < endOfDay) return { sent: [] };
+  // Yesterday's end-of-day has always passed — the look-back keeps a downed
+  // evening from meaning "the photographer never gets a link".
+  const dates = now >= endOfDay ? [today, bizDate(tz, -1, now)] : [bizDate(tz, -1, now)];
 
   const rows = await db()
     .select({
@@ -220,18 +269,17 @@ export async function sendUploadLinks(now = new Date()): Promise<{ sent: string[
     .innerJoin(suppliers, eq(suppliers.id, supplierDays.supplierId))
     .innerJoin(shootRequests, eq(shootRequests.id, shootSlots.shootRequestId))
     .innerJoin(clients, eq(clients.id, shootRequests.clientId))
-    .where(and(eq(supplierDays.date, today), inArray(shootRequests.status, ["READY", "CONFIRMED"])));
+    .where(
+      and(
+        inArray(supplierDays.date, dates),
+        inArray(shootRequests.status, ["READY", "CONFIRMED", "AWAITING_DELIVERY"]),
+      ),
+    );
 
   const sent: string[] = [];
   for (const row of rows) {
     try {
       const idempotencyKey = `upload:${row.requestId}:${row.shootDate}`;
-      const [already] = await db()
-        .select({ status: notifications.status })
-        .from(notifications)
-        .where(eq(notifications.idempotencyKey, idempotencyKey));
-      if (already && already.status !== "FAILED") continue;
-
       const result = await sendUploadLink(row, idempotencyKey, now);
       if (result === "SENT") sent.push(row.requestId);
     } catch (err) {
@@ -241,69 +289,120 @@ export async function sendUploadLinks(now = new Date()): Promise<{ sent: string[
   return { sent };
 }
 
+interface UploadLinkTarget {
+  requestId: string;
+  clientName: string;
+  supplierId: string;
+  supplierName: string;
+  supplierPhone: string | null;
+  shootDate: string;
+}
+
+/**
+ * Mint + deliver one upload link. The whole check→mint→send runs under the
+ * request row lock (same serialization as the brief/date links) — concurrent
+ * sweep + console reminder cannot double-send or double-mint.
+ */
 async function sendUploadLink(
-  row: {
-    requestId: string;
-    clientName: string;
-    supplierId: string;
-    supplierName: string;
-    supplierPhone: string | null;
-    shootDate: string;
-  },
+  row: UploadLinkTarget,
   idempotencyKey: string,
   now: Date,
+  opts: { record?: (tx: Tx) => Promise<void> } = {},
 ): Promise<"SENT" | "DUPLICATE" | "FAILED"> {
   const rules = await loadRules(db());
-  // The link must outlive the SLA (plus escalation grace) comfortably.
   const slaDays = rules.int(RULE.deliverableSlaDays);
   const graceH = rules.int(RULE.deliverableEscalateGraceHours);
-  const expiresAt = addHours(now, slaDays * 24 * 3 + graceH + 7 * 24);
-  const { token, id: tokenId } = await issueToken(db(), {
-    purpose: "UPLOAD_DELIVERABLES",
-    entityType: "shoot_request",
-    entityId: row.requestId,
-    supplierId: row.supplierId,
-    expiresAt,
-  });
-  const url = `${appOrigin()}/s/${token}`;
+  const expiresAt = uploadLinkExpiry(now, slaDays, graceH);
   // Display-only approximation for the message body; the binding deadline is
   // computed by the transition when the shoot completes.
   const dueText = shortDate(bizDate(rules.string(RULE.timezone), slaDays, now));
-  const result = await sendNotification(
-    db(),
-    {
-      template: "upload_deliverables",
-      recipient: row.supplierPhone ?? row.supplierName,
-      title: notifyTemplates.uploadDeliverables.title,
-      body: notifyTemplates.uploadDeliverables.body(row.supplierName, row.clientName, dueText, url),
-      url,
-      redacted: {
-        body: notifyTemplates.uploadDeliverables.body(
-          row.supplierName,
-          row.clientName,
-          dueText,
-          `[link:${tokenId}]`,
-        ),
-        url: `[link:${tokenId}]`,
-      },
+
+  return db().transaction(async (tx) => {
+    await tx
+      .select({ id: shootRequests.id })
+      .from(shootRequests)
+      .where(eq(shootRequests.id, row.requestId))
+      .for("update");
+    const [already] = await tx
+      .select({ status: notifications.status })
+      .from(notifications)
+      .where(eq(notifications.idempotencyKey, idempotencyKey));
+    if (already && already.status !== "FAILED") return "DUPLICATE" as const;
+
+    const { token, id: tokenId } = await issueToken(tx, {
+      purpose: "UPLOAD_DELIVERABLES",
       entityType: "shoot_request",
       entityId: row.requestId,
-      idempotencyKey,
-    },
-    {
-      record: async (tx) => {
-        await tx.insert(events).values({
-          entityType: "shoot_request",
-          entityId: row.requestId,
-          kind: "MESSAGE_SENT",
-          actorType: "SYSTEM",
-          summary: timelineNotes.uploadLinkSent(row.supplierName),
-          createdAt: now,
-        });
+      supplierId: row.supplierId,
+      expiresAt,
+    });
+    const url = `${appOrigin()}/s/${token}`;
+    const result = await sendNotification(
+      tx,
+      {
+        template: "upload_deliverables",
+        recipient: row.supplierPhone ?? row.supplierName,
+        title: notifyTemplates.uploadDeliverables.title,
+        body: notifyTemplates.uploadDeliverables.body(row.supplierName, row.clientName, dueText, url),
+        url,
+        redacted: {
+          body: notifyTemplates.uploadDeliverables.body(
+            row.supplierName,
+            row.clientName,
+            dueText,
+            `[link:${tokenId}]`,
+          ),
+          url: `[link:${tokenId}]`,
+        },
+        entityType: "shoot_request",
+        entityId: row.requestId,
+        idempotencyKey,
       },
+      {
+        record:
+          opts.record ??
+          (async (rtx) => {
+            await rtx.insert(events).values({
+              entityType: "shoot_request",
+              entityId: row.requestId,
+              kind: "MESSAGE_SENT",
+              actorType: "SYSTEM",
+              summary: timelineNotes.uploadLinkSent(row.supplierName),
+              createdAt: now,
+            });
+          }),
+      },
+    );
+    return result.status;
+  });
+}
+
+/**
+ * Console "remind the photographer about deliverables": a reminder without a
+ * working link is useless — re-mint and deliver the real thing (windowed by
+ * the caller's idempotency key).
+ */
+export async function resendUploadLink(
+  requestId: string,
+  opts: { idempotencyKey?: string; record?: (tx: Tx) => Promise<void> } = {},
+  at = new Date(),
+): Promise<{ status: "SENT" | "DUPLICATE" | "FAILED" }> {
+  const shoot = await shootRow(db(), requestId);
+  if (!shoot || !shoot.shootDate) throw new Error(`request ${requestId} has no confirmed slot`);
+  const status = await sendUploadLink(
+    {
+      requestId,
+      clientName: shoot.clientName,
+      supplierId: shoot.supplierId,
+      supplierName: shoot.supplierName,
+      supplierPhone: shoot.supplierPhone,
+      shootDate: shoot.shootDate,
     },
+    opts.idempotencyKey ?? `upload:${requestId}:${shoot.shootDate}`,
+    at,
+    { record: opts.record },
   );
-  return result.status;
+  return { status };
 }
 
 export interface DeliverablesPage {
@@ -361,20 +460,33 @@ export async function markShootDoneViaToken(
   const requestId = verified.token.entityId;
   const shoot = await shootRow(db(), requestId);
   if (!shoot) return { ok: false, reason: "INVALID" };
-  if (shoot.status !== "READY" && shoot.status !== "CONFIRMED") {
-    // Already past this stage — not an error, the page just moves on.
+  const alreadyDone = async (): Promise<MarkDoneResult> => {
     const [d] = await db()
       .select({ dueAt: deliverables.dueAt })
       .from(deliverables)
       .where(eq(deliverables.shootRequestId, requestId));
     return { ok: true, dueAt: d?.dueAt ?? null };
+  };
+  if (shoot.status !== "READY" && shoot.status !== "CONFIRMED") {
+    // Already past this stage — not an error, the page just moves on.
+    return alreadyDone();
   }
-  const { dueAt } = await markShootCompleted(
-    { type: "SUPPLIER", id: shoot.supplierId },
-    requestId,
-    at,
-  );
-  return { ok: true, dueAt };
+  try {
+    const { dueAt } = await markShootCompleted(
+      { type: "SUPPLIER", id: shoot.supplierId },
+      requestId,
+      at,
+    );
+    return { ok: true, dueAt };
+  } catch (err) {
+    // Concurrent double-press: the other press won the transition. If the
+    // request is indeed past READY now, this press SUCCEEDED in spirit.
+    const after = await shootRow(db(), requestId);
+    if (after && after.status !== "READY" && after.status !== "CONFIRMED") {
+      return alreadyDone();
+    }
+    throw err;
+  }
 }
 
 export type SubmitResult =
@@ -457,11 +569,24 @@ export async function flagOverdueDeliverables(now = new Date()): Promise<{ flagg
   for (const { requestId } of rows) {
     try {
       await db().transaction(async (tx) => {
+        // REQUEST → deliverable lock order, matching submitDeliverables — the
+        // reverse order deadlocks against a photographer submitting right now.
+        const [req] = await tx
+          .select()
+          .from(shootRequests)
+          .where(eq(shootRequests.id, requestId))
+          .for("update");
+        if (
+          !req ||
+          req.status !== "AWAITING_DELIVERY" ||
+          req.currentAction !== "UPLOAD_DELIVERABLES"
+        ) {
+          return;
+        }
         const [d] = await tx
           .select()
           .from(deliverables)
-          .where(eq(deliverables.shootRequestId, requestId))
-          .for("update");
+          .where(eq(deliverables.shootRequestId, requestId));
         if (!d || (d.status !== "AWAITING_UPLOAD" && d.status !== "PARTIAL")) return;
         await applyTransition(tx, requestId, {
           kind: "DELIVERABLES_OVERDUE",

@@ -493,13 +493,20 @@ async function seed(db: Db): Promise<void> {
       .insert(s.briefs)
       .values({ shootRequestId: r.id, status: "SENT_TO_SUPPLIER", approvedAt: d(2), sentToSupplierAt: d(2) })
       .returning();
-    await db.insert(s.briefVersions).values({
-      briefId: brief.id,
-      version: 1,
-      content: { goal: "סרטוני הסברה למטופלים", shotList: "חדר טיפולים · קבלה · ראיון קצר עם ד\"ר רוזן" },
-      authorId: yuval.id,
-      isApproved: true,
-    });
+    // Born a draft, then the one permitted flip — the trigger allows no other path.
+    const [t1Version] = await db
+      .insert(s.briefVersions)
+      .values({
+        briefId: brief.id,
+        version: 1,
+        content: { goal: "סרטוני הסברה למטופלים", shotList: "חדר טיפולים · קבלה · ראיון קצר עם ד\"ר רוזן" },
+        authorId: yuval.id,
+      })
+      .returning();
+    await db
+      .update(s.briefVersions)
+      .set({ isApproved: true })
+      .where(eq(s.briefVersions.id, t1Version.id));
     // The photographer never pressed "דיברתי עם הלקוח"
     await fire(r.id, { kind: "T1_MISSED", at: h(1), actor: system });
   }

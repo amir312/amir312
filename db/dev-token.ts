@@ -18,6 +18,7 @@ import {
   supplierDays,
   suppliers,
 } from "./schema";
+import { uploadLinkExpiry } from "@/lib/services/deliverables";
 import { issueToken, type TokenPurpose } from "@/lib/tokens";
 import { loadRules } from "@/lib/workflow/apply";
 import { RULE } from "@/lib/workflow/rules";
@@ -128,7 +129,7 @@ async function main() {
     return print(
       "UPLOAD_DELIVERABLES",
       row.id,
-      new Date(Date.now() + (slaDays * 24 * 3 + graceH + 7 * 24) * 3_600_000),
+      uploadLinkExpiry(new Date(), slaDays, graceH),
       row.supplierId,
     );
   }

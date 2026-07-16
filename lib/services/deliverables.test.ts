@@ -134,9 +134,44 @@ describe("the upload link sweep", () => {
     expect(uploads).toHaveLength(1);
     expect(JSON.stringify(uploads[0].payload)).not.toMatch(/\/s\/[A-Za-z0-9_-]{20,}/);
 
-    // before end-of-day the sweep sends nothing
+    // before end-of-day the sweep does not target today's shoots
     const morning = new Date(dateAtHourInTz(bizToday(0), 20, TZ).getTime() - 5 * HOUR);
-    expect((await deliverables.sendUploadLinks(morning)).sent).toEqual([]);
+    expect((await deliverables.sendUploadLinks(morning)).sent).not.toContain(world.req.id);
+  });
+
+  it("look-back: a shoot whose evening runs were missed still gets its link the NEXT morning", async () => {
+    // The shoot happened yesterday; no sweep ran that evening.
+    const world = await seedReadyWorld("סטודיו אתמול", { date: bizToday(-1) });
+    const { dateAtHourInTz } = await import("@/lib/workflow/time");
+    const nextMorning = new Date(dateAtHourInTz(bizToday(0), 9, TZ).getTime());
+
+    const swept = await deliverables.sendUploadLinks(nextMorning);
+    expect(swept.sent).toContain(world.req.id);
+    const tokens = (
+      await t.db.select().from(s.accessTokens).where(eq(s.accessTokens.entityId, world.req.id))
+    ).filter((r) => r.purpose === "UPLOAD_DELIVERABLES");
+    expect(tokens).toHaveLength(1);
+  });
+
+  it("the console reminder delivers a WORKING fresh link, windowed", async () => {
+    const world = await seedReadyWorld("מספרה עם תזכורת");
+    await deliverables.markShootCompleted({ type: "COORDINATOR", id: smId }, world.req.id);
+
+    const key = `rem:test:${world.req.id}:0`;
+    const first = await deliverables.resendUploadLink(world.req.id, { idempotencyKey: key });
+    expect(first.status).toBe("SENT");
+    const second = await deliverables.resendUploadLink(world.req.id, { idempotencyKey: key });
+    expect(second.status).toBe("DUPLICATE");
+
+    const tokens = (
+      await t.db.select().from(s.accessTokens).where(eq(s.accessTokens.entityId, world.req.id))
+    ).filter((r) => r.purpose === "UPLOAD_DELIVERABLES");
+    expect(tokens).toHaveLength(1); // the duplicate minted nothing
+    const notes = (
+      await t.db.select().from(s.notifications).where(eq(s.notifications.entityId, world.req.id))
+    ).filter((n) => n.template === "upload_deliverables");
+    expect(notes).toHaveLength(1);
+    expect(JSON.stringify(notes[0].payload)).not.toMatch(/\/s\/[A-Za-z0-9_-]{20,}/);
   });
 });
 
@@ -211,6 +246,25 @@ describe("THE auto-chain: uploaded → forwarded → closed → entitlement cons
     expect(replay).toEqual({ ok: false, reason: "USED" });
     const page3 = await deliverables.getDeliverablesPage(token);
     expect(page3).toMatchObject({ ok: true, page: { stage: "DONE" } });
+  });
+
+  it("a concurrent double-press of 'הצילום בוצע' succeeds for both presses, one transition", async () => {
+    const world = await seedReadyWorld("חנות הלחיצה הכפולה");
+    const token = await mintUploadToken(world.req.id, world.supplier.id);
+
+    const [a, b] = await Promise.all([
+      deliverables.markShootDoneViaToken(token),
+      deliverables.markShootDoneViaToken(token),
+    ]);
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+
+    const evts = await t.db
+      .select()
+      .from(s.events)
+      .where(and(eq(s.events.entityId, world.req.id), eq(s.events.kind, "SHOOT_COMPLETED")));
+    expect(evts).toHaveLength(1);
+    expect((await requestRow(world.req.id)).status).toBe("AWAITING_DELIVERY");
   });
 
   it("a non-https or garbage link is refused before anything moves", async () => {

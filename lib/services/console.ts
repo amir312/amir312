@@ -27,10 +27,16 @@ import { sendNotification } from "@/lib/notify";
 import { applyTransition, loadRules } from "@/lib/workflow/apply";
 import { RULE } from "@/lib/workflow/rules";
 import { suggestFor, type Suggestion, type SuggestionKey } from "@/lib/workflow/suggestions";
+import { shiftIsoDate } from "@/lib/workflow/time";
 import type { NextAction, OwnerType, RequestStatus } from "@/lib/workflow/types";
 import { assertOnlyRematchDeferred, expireHold } from "./holds";
 import { approveMatch, rematchFreeHalf, resendChooseDateLink, runMatcherForRequest } from "./matching";
-import { forwardAndClose, markShootCompleted, notifyForwarded } from "./deliverables";
+import {
+  forwardAndClose,
+  markShootCompleted,
+  notifyForwarded,
+  resendUploadLink,
+} from "./deliverables";
 import { resendBriefApprovalLink } from "./briefs";
 
 export interface ExceptionItem {
@@ -208,10 +214,14 @@ export interface UpcomingSlot {
   halfFree: boolean;
 }
 
-/** Date string (YYYY-MM-DD) as seen in `tz` at `base` (default: now), shifted by n days. */
+/**
+ * Date string (YYYY-MM-DD) as seen in `tz` at `base` (default: now), shifted
+ * by n CALENDAR days. The shift happens on the date string, not on the
+ * timestamp — a 25-hour DST day cannot make "tomorrow" equal "today".
+ */
 export function bizDate(tz: string, offsetDays = 0, base = new Date()): string {
-  const d = new Date(base.getTime() + offsetDays * 86_400_000);
-  return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(base);
+  return offsetDays === 0 ? today : shiftIsoDate(today, offsetDays);
 }
 
 /** The business timezone, from the rules table — never hardcoded. */
@@ -441,9 +451,39 @@ export async function executeSuggestion(
         return { ok: true };
       }
 
-      case "REMIND_SUBMITTER":
-      case "REMIND_BRIEF_OWNER":
       case "REMIND_SUPPLIER_DELIVERABLES": {
+        // Same principle again: the photographer gets a WORKING upload link.
+        const requestId = mustRequest(ref);
+        const rules = await loadRules(db());
+        const windowH = rules.int(RULE.reminderWindowHours);
+        const bucket = Math.floor(at.getTime() / (windowH * 3_600_000));
+        const { recipientName } = await reminderRecipient(key, requestId);
+        const result = await resendUploadLink(
+          requestId,
+          {
+            idempotencyKey: `rem:${key}:${requestId}:${bucket}`,
+            record: async (tx) => {
+              await tx.insert(events).values({
+                entityType: "shoot_request",
+                entityId: requestId,
+                kind: "MESSAGE_SENT",
+                actorType: "COORDINATOR",
+                actorId: user.id,
+                summary: timelineNotes.reminderSent(recipientName),
+                payload: { template: key },
+                createdAt: at,
+              });
+            },
+          },
+          at,
+        );
+        if (result.status === "DUPLICATE") return { ok: true, message: "DUPLICATE" };
+        if (result.status === "FAILED") return { ok: false, error: errors.actionFailed };
+        return { ok: true };
+      }
+
+      case "REMIND_SUBMITTER":
+      case "REMIND_BRIEF_OWNER": {
         return sendReminder(user, key, mustRequest(ref), at);
       }
 

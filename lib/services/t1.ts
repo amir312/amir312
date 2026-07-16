@@ -24,6 +24,9 @@ import { bizDate } from "./console";
 
 const appOrigin = () => process.env.APP_ORIGIN ?? "http://localhost:3000";
 
+// Link-TTL margin past shoot-day end — operational grace, not a business rule.
+const T1_LINK_GRACE_HOURS = 2;
+
 /** Tomorrow's confirmed slots whose photographer still owes the T-1 press. */
 async function slotsAwaitingT1(date: string) {
   return db()
@@ -84,7 +87,7 @@ export async function sendT1Links(now = new Date()): Promise<{ sent: string[]; s
       // The button works until end of shoot day (late pressing still counts).
       const expiresAt = addHours(
         dateAtHourInTz(slot.shootDate, rules.int(RULE.shootDayEndHour), tz),
-        2,
+        T1_LINK_GRACE_HOURS,
       );
       const { token, id: tokenId } = await issueToken(db(), {
         purpose: "CONFIRM_T1",
@@ -228,6 +231,18 @@ export async function confirmT1(rawToken: string, at = new Date()): Promise<T1Co
         actor: { type: "SUPPLIER", id: slot.supplierId },
         supplierId: slot.supplierId,
         shootDate: slot.shootDate,
+      });
+    } else {
+      // A late press after the workflow moved on: the stamp is a real fact,
+      // and every state write gets its timeline row (invariant 2).
+      await tx.insert(events).values({
+        entityType: "shoot_request",
+        entityId: requestId,
+        kind: "T1_CONFIRMED_LATE",
+        actorType: "SUPPLIER",
+        actorId: slot.supplierId,
+        summary: timelineNotes.t1ConfirmedLate,
+        createdAt: at,
       });
     }
     await markTokenUsed(tx, verified.token.id, at);

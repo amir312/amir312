@@ -87,6 +87,7 @@ export const timelineNotes = {
   briefDraftSaved: (version: number) => `נשמרה טיוטת בריף (גרסה ${version})`,
   t1LinkSent: (supplierName: string) => `נשלח לצלם ${supplierName} קישור לאישור תיאום`,
   uploadLinkSent: (supplierName: string) => `נשלח לצלם ${supplierName} קישור להעלאת תוצרים`,
+  t1ConfirmedLate: "הצלם אישר תיאום מול הלקוח (לאחר שהטיפול כבר התקדם)",
 };
 
 /** Region codes are internal — users always see these. */
@@ -598,7 +599,6 @@ export const t1T = {
   confirmedTitle: "מעולה, נרשם!",
   confirmedBody: "נתראה מחר בצילום. בהצלחה! 📸",
   alreadyConfirmed: "התיאום כבר אושר — נתראה בצילום!",
-  briefLink: "לבריף המאושר",
 };
 
 /** The photographer's deliverables page (/s/[token]) + the request-page card. */

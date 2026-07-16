@@ -223,6 +223,65 @@ describe("client approval → THE lock → auto-send to the photographer", () =>
     await expect(briefs.saveBriefDraft(sm, req.id, { goal: "עוד גרסה" })).rejects.toThrow(
       errors.briefLocked,
     );
+
+    // INSERTING an already-approved impostor version is refused at the DB —
+    // what the photographer sees cannot be redefined by any writer.
+    await expectDbError(
+      t.db.insert(s.briefVersions).values({
+        briefId: view.brief!.id,
+        version: 99,
+        content: { goal: "גרסה מתחזה" },
+        isApproved: true,
+      }),
+      /born a draft/,
+    );
+    // …and a second approved version per brief violates the partial unique index.
+    const [draft] = await t.db
+      .insert(s.briefVersions)
+      .values({ briefId: view.brief!.id, version: 100, content: { goal: "טיוטה" } })
+      .returning();
+    await expectDbError(
+      t.db.update(s.briefVersions).set({ isApproved: true }).where(eq(s.briefVersions.id, draft.id)),
+      /brief_versions_single_approved/,
+    );
+  });
+
+  it("the supplier hand-off is its own guarded step: repeat delivery is a no-op", async () => {
+    const { req } = await seedBriefWorld(futureDate(17));
+    await briefs.saveBriefDraft(sm, req.id, { goal: "מסירה חוזרת" });
+    await briefs.sendBriefToClient(sm, req.id);
+    await briefs.approveBrief(await mintApprovalToken(req.id));
+
+    // approveBrief already delivered (spine → READY). A sweep retry finds the
+    // hand-off done and changes nothing.
+    const again = await briefs.deliverApprovedBriefToSupplier(req.id);
+    expect(again.status).toBe("SKIPPED");
+    const supplierNotes = (
+      await t.db.select().from(s.notifications).where(eq(s.notifications.entityId, req.id))
+    ).filter((n) => n.template === "brief_to_supplier");
+    expect(supplierNotes).toHaveLength(1);
+    const viewTokens = (
+      await t.db.select().from(s.accessTokens).where(eq(s.accessTokens.entityId, req.id))
+    ).filter((r) => r.purpose === "VIEW_SHOOT");
+    expect(viewTokens).toHaveLength(1);
+  });
+
+  it("two concurrent reminder sends serialize: exactly ONE live link survives", async () => {
+    const { req } = await seedBriefWorld(futureDate(18));
+    await briefs.saveBriefDraft(sm, req.id, { goal: "מרוץ תזכורות" });
+    await briefs.sendBriefToClient(sm, req.id);
+
+    const key = `race:${req.id}`;
+    const results = await Promise.all([
+      briefs.resendBriefApprovalLink(req.id, { idempotencyKey: key }),
+      briefs.resendBriefApprovalLink(req.id, { idempotencyKey: key }),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual(["DUPLICATE", "SENT"]);
+
+    const live = (
+      await t.db.select().from(s.accessTokens).where(eq(s.accessTokens.entityId, req.id))
+    ).filter((r) => r.purpose === "APPROVE_BRIEF" && r.revokedAt === null && r.usedAt === null);
+    expect(live).toHaveLength(1);
   });
 
   it("changes requested: feedback lands, spine returns to the writer, the DEADLINE DOES NOT MOVE", async () => {

@@ -290,3 +290,93 @@ transitions.ts at 100/100 lines and branches).
    count in the summary) — information for Noam, never an auto-booking (invariant 1).
 5. A USED choose-date link renders the outcome ("המועד אושר" / declined) instead of an error —
    the no-JS double-submit and the "what did I click?" reload both land somewhere honest.
+
+---
+
+## Phase 4 — Brief, T-1, deliverables, unified timeline
+
+**Built:**
+- `lib/brief/templates.ts` + `lib/services/briefs.ts` — the brief lifecycle: template per
+  shoot type (script only where it earns its place), versioned drafts, one-shot APPROVE_BRIEF
+  client link at `/c/[token]` (approve / "יש לי הערות" with feedback — no-JS safe), **the
+  approved version locks at the DATABASE layer** (trigger: no update, no delete, no
+  born-approved insert; partial unique index: one approved version per brief), and the
+  hand-off: deliver the photographer's read-only VIEW_SHOOT link FIRST, record
+  BRIEF_SENT_TO_SUPPLIER only on success — a failed send is a visible SEND_BRIEF_TO_SUPPLIER
+  stall the hourly sweep retries. Changes-requested loops back with feedback; **the brief
+  deadline does not move.** Deadlines from `rules.brief_lead_days` via the machine.
+- `lib/services/t1.ts` — T-1 as a first-class flow: hourly sweep sends every photographer
+  shooting tomorrow a ONE-BUTTON link ("דיברתי עם הלקוח"); `confirmT1` is idempotent (second
+  press → "already"); past `rules.t_minus_1_deadline_hour` the un-pressed slot fires T1_MISSED
+  → immediately-ESCALATED exception with Noam's one-click fix, guarded to fire exactly once.
+- `lib/services/deliverables.ts` — the closing chain: mark-complete starts the SLA clock
+  (business days from rules, per-supplier override wins), the upload link goes out after
+  shoot-day end (with a YESTERDAY look-back so a downed evening never orphans a photographer),
+  `submitDeliverables` runs uploaded → **forwarded automatically → REQUEST_CLOSED →
+  entitlement CONSUMEd in ONE transaction**, the drive link lands with the social manager /
+  client post-commit (stable idempotency key; FAILED sends retried by the sweep). Overdue
+  sweep escalates once, late delivery still closes the loop. Links only — no media hosted.
+- `/c/[token]` + `/s/[token]` are now purpose-dispatched (`peekTokenPurpose` routes, every
+  leaf handler re-verifies): choose-date / brief-approval · availability / T-1 / upload /
+  supplier brief view (approved version ONLY — drafts are structurally invisible).
+- Request page: brief card (editor from the template while editable, locked view after),
+  deliverables card, shoot header, and the manual-note box — a MANUAL_NOTE event straight
+  into the append-only timeline, so phone-call context lives in the system, not in Noam's head.
+- Console: MARK_SHOT / FORWARD_NOW delegate to the same service code paths as the photographer
+  buttons; REMIND_CLIENT_BRIEF and REMIND_SUPPLIER_DELIVERABLES re-mint and deliver WORKING
+  links (windowed, atomic timeline record) — never a linkless nudge.
+- Jobs (hourly, all idempotent): `t1-sweep`, `deliverables-sweep` (+ failed-forward retry),
+  `brief-sweep` (late-brief auto-reminders + stalled hand-off retry).
+- `db/dev-token.ts` modes `brief`/`t1`/`upload`; seed now shows a CLIENT_REVIEW brief with
+  real content and drives every confirmed slot through the production executor.
+
+**Acceptance — the full DEFINITION OF DONE, steps 1–15 (`lib/services/dod.test.ts` walks 1–14
+through the real services against real Postgres; step 15 is the gate run itself):**
+
+| # | step | result |
+| --- | --- | --- |
+| 1 | missing field → MISSING_INFO, gaps NAMED, submitter owns on a deadline | **PASS** |
+| 2 | fix → PENDING_MATCH | **PASS** |
+| 3 | matcher proposes a PAIRED day, Hebrew reason names the partner | **PASS** |
+| 4 | approve → whole day soft-held, expiry visible | **PASS** |
+| 5 | both clients linked in parallel, raw tokens never stored | **PASS** |
+| 6 | A selects; B never answers, hold expires | **PASS** |
+| 7 | A CONFIRMED · B released · day PARTIALLY_CONFIRMED · incident with candidates | **PASS** |
+| 8 | brief task on deadline → late → auto-reminder → ESCALATED in the console | **PASS** |
+| 9 | client approves → version LOCKS → auto-sent to the photographer | **PASS** |
+| 10 | T-1 never pressed → prominent exception | **PASS** |
+| 11 | shoot completed → SLA clock → lapses → exception | **PASS** |
+| 12 | Drive link → auto-forward → closed → entitlement consumed (balance 0) | **PASS** |
+| 13 | every step a row in ONE unified timeline | **PASS** |
+| 14 | supplier session sees ZERO foreign supplier_days rows (unfiltered probe) | **PASS** |
+| 15 | `pnpm typecheck && lint && test && build` | **PASS** — 154 tests; e2e 37/37 (desktop + 390px) |
+
+**Reviewer findings and fixes** (fresh-context subagent, verdict FIX-FIRST; every finding
+fixed and re-verified, including its live concurrency probes re-covered as regression tests):
+
+| # | severity | finding | resolution |
+| --- | --- | --- | --- |
+| P4-1 | MAJOR | immutability was UPDATE/DELETE-only: INSERTing a pre-approved "version 99" redefined what the photographer sees, silently (proven) | trigger now rejects born-approved INSERTs; partial unique index `brief_versions_single_approved` — one approved version per brief, at the DB; seed flips instead of inserting approved; regression tests for both holes |
+| P4-2 | MINOR | proven AB-BA deadlock: overdue sweep locked deliverable→request while submit locked request→deliverable | sweep now locks the REQUEST first (same order as submit), then re-checks the deliverable status |
+| P4-3 | MINOR | auto-send failures were silent and unretriable: BRIEF_SENT_TO_SUPPLIER recorded before delivery was known; forwarded-notification failures invisible on a COMPLETED request | hand-off split: deliver first, transition only on success — a failure parks VISIBLY on SEND_BRIEF_TO_SUPPLIER and the brief-sweep retries with a fresh link; `retryFailedForwards` re-attempts failed drive-link sends on the stable key every sweep |
+| P4-4 | MINOR | upload-link send had no look-back (downed evening = photographer never linked) and the console deliverables reminder carried NO link | sweep scans [today, yesterday]; `resendUploadLink` powers REMIND_SUPPLIER_DELIVERABLES with a real, windowed, recorded link |
+| P4-5 | MINOR | concurrent brief-reminder sends left TWO live one-shot links / could revoke the just-delivered one (proven) | the whole check→revoke→mint→send now runs under the request row lock (`sendNotification` accepts an open transaction); same serialization applied to upload links; race regression test (2 concurrent → 1 SENT + 1 DUPLICATE, exactly one live token) |
+| P4-6 | NIT | `bizDate` day-add was DST-naive (fall-back night: "tomorrow" = today for the 00:xx run) | date-string arithmetic via `shiftIsoDate` — a 25-hour day cannot fold the calendar |
+| P4-7 | NIT | concurrent double-press of "הצילום בוצע" reported failure for a press that succeeded | tolerant already-done path (state re-checked after a lost race); regression test: two presses, both ok, ONE transition |
+| P4-8 | NIT | "יש לי הערות" required JavaScript | native `<details>` — the feedback form ships in the HTML |
+| P4-9 | NIT | hardcoded display timezone (new page) + magic link-TTL margins scattered/duplicated | tz from `rules.timezone` via `getTimezone()`; TTL margins are named constants; `uploadLinkExpiry` shared with dev-token |
+| P4-10 | NIT | a late T-1 press could stamp the slot with no timeline row; unused i18n string | late press writes a `T1_CONFIRMED_LATE` event (every state write gets its row); dead string removed |
+
+**Decisions the spec did not dictate:**
+1. Brief approver is the CLIENT (their contact link), also for managed clients — the SM writes,
+   the client approves; the spec's "client approves at /c/[token]" taken literally.
+2. "Sent to the photographer automatically" is recorded ONLY after the link actually went out;
+   until then the request deliberately stalls, visibly, on SYSTEM/SEND_BRIEF_TO_SUPPLIER.
+   Honest state over optimistic state.
+3. The T-1 link is not one-shot for viewing (a revisit shows "already confirmed"); the upload
+   link is consumed only by the final submit (mark-complete keeps it alive) — one-shot exactly
+   where the ACTION is one-shot.
+4. A manual note is a timeline FACT, not a transition — direct append-only insert, attributed.
+5. Deliverables auto-forward targets the social manager for managed clients, the client
+   otherwise; the drive URL also renders on the request page, so a failed notification (P4-3)
+   degrades to "visible in the console", never "lost".

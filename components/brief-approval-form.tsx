@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { useActionState } from "react";
 import { briefChoiceAction, type BriefChoiceState } from "@/app/actions";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -11,7 +11,6 @@ export function BriefApprovalForm({ token }: { token: string }) {
     briefChoiceAction,
     {},
   );
-  const [showFeedback, setShowFeedback] = useState(false);
 
   if (state.outcome === "APPROVED") {
     return (
@@ -44,8 +43,12 @@ export function BriefApprovalForm({ token }: { token: string }) {
           {briefT.approve}
         </Button>
       </form>
-      {showFeedback ? (
-        <form action={formAction} className="flex flex-col gap-2 rounded-lg border p-3">
+      {/* Always rendered (native <details>) — requesting changes must work without JS too. */}
+      <details className="rounded-lg border">
+        <summary className="cursor-pointer p-3 text-sm font-medium">
+          {briefT.requestChanges}
+        </summary>
+        <form action={formAction} className="flex flex-col gap-2 border-t p-3">
           <input type="hidden" name="token" value={token} />
           <input type="hidden" name="decision" value="changes" />
           <label className="text-sm font-medium" htmlFor="brief-feedback">
@@ -63,11 +66,7 @@ export function BriefApprovalForm({ token }: { token: string }) {
             {briefT.requestChanges}
           </Button>
         </form>
-      ) : (
-        <Button type="button" variant="outline" onClick={() => setShowFeedback(true)}>
-          {briefT.requestChanges}
-        </Button>
-      )}
+      </details>
     </div>
   );
 }

@@ -12,7 +12,11 @@ import { matchAllPending, rematchFreeHalf } from "@/lib/services/matching";
 import { sendWeeklyAvailabilityRequests } from "@/lib/services/availability";
 import { sweepLateBriefs } from "@/lib/services/briefs";
 import { flagMissedT1, sendT1Links } from "@/lib/services/t1";
-import { flagOverdueDeliverables, sendUploadLinks } from "@/lib/services/deliverables";
+import {
+  flagOverdueDeliverables,
+  retryFailedForwards,
+  sendUploadLinks,
+} from "@/lib/services/deliverables";
 import { inngest } from "./client";
 
 function appOrigin(): string {
@@ -71,7 +75,14 @@ export const deliverablesSweepFn = inngest.createFunction(
     const now = new Date();
     const links = await sendUploadLinks(now);
     const overdue = await flagOverdueDeliverables(now);
-    return { uploadLinks: links.sent.length, flaggedOverdue: overdue.flagged.length };
+    // COMPLETED requests are invisible in the console — failed forward
+    // notifications get their retry here, on the same idempotency key.
+    const forwards = await retryFailedForwards();
+    return {
+      uploadLinks: links.sent.length,
+      flaggedOverdue: overdue.flagged.length,
+      retriedForwards: forwards.retried.length,
+    };
   },
 );
 

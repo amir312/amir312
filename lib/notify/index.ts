@@ -11,7 +11,7 @@
  *   key exists, FAILED   → retried: delivery attempted again on the same row.
  */
 import { eq } from "drizzle-orm";
-import type { Db, Tx } from "@/db/client";
+import type { Db, DbLike, Tx } from "@/db/client";
 import { notifications } from "@/db/schema";
 import { loadRules } from "@/lib/workflow/apply";
 import { RULE } from "@/lib/workflow/rules";
@@ -44,10 +44,14 @@ export interface SendOptions {
 }
 
 export async function sendNotification(
-  db: Db,
+  dbc: DbLike,
   message: OutboundMessage,
   opts: SendOptions = {},
 ): Promise<SendResult> {
+  // Accepts the root client OR an open transaction — inside a transaction the
+  // inner .transaction() is a savepoint, so callers can serialize
+  // check-revoke-mint-send sequences under one row lock.
+  const db = dbc as Db;
   const planned = await db.transaction(async (tx) => {
     const rules = await loadRules(tx);
     const requested = rules.string(RULE.notifyChannelDefault) as Channel;

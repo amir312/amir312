@@ -15,6 +15,7 @@ import {
   briefs,
   clients,
   events,
+  notifications,
   shootRequests,
   shootSlots,
   supplierDays,
@@ -31,6 +32,11 @@ import { addHours, dateAtHourInTz } from "@/lib/workflow/time";
 import type { BriefOwner } from "@/lib/workflow/types";
 
 const appOrigin = () => process.env.APP_ORIGIN ?? "http://localhost:3000";
+
+// Link-TTL margins — operational grace on top of rules-derived anchor times,
+// not business rules (the deadlines themselves always come from `rules`).
+const APPROVAL_LINK_GRACE_HOURS = 24;
+const SUPPLIER_BRIEF_LINK_EXTRA_DAYS = 7;
 
 // ─────────────────────────────────────────────────────────────
 // Shared context
@@ -252,6 +258,12 @@ export async function sendBriefToClient(
   return sendBriefApprovalLink(requestId, ctx, at);
 }
 
+/**
+ * Mint + deliver the client's approval link. The ENTIRE check→revoke→mint→
+ * send sequence runs under the request row lock — two concurrent reminders
+ * (sweep + console click) serialize instead of leaving two live links or
+ * revoking the one that was just delivered.
+ */
 async function sendBriefApprovalLink(
   requestId: string,
   shoot: Awaited<ReturnType<typeof confirmedShootContext>>,
@@ -264,50 +276,65 @@ async function sendBriefApprovalLink(
   // The link must survive until the shoot itself — the client may approve late.
   const expiresAt = addHours(
     dateAtHourInTz(shoot.shootDate, rules.int(RULE.shootDayEndHour), tz),
-    24,
+    APPROVAL_LINK_GRACE_HOURS,
   );
-  await db()
-    .update(accessTokens)
-    .set({ revokedAt: at })
-    .where(
-      and(
-        eq(accessTokens.purpose, "APPROVE_BRIEF"),
-        eq(accessTokens.entityId, requestId),
-        isNull(accessTokens.revokedAt),
-        isNull(accessTokens.usedAt),
-      ),
-    );
-  const { token, id: tokenId } = await issueToken(db(), {
-    purpose: "APPROVE_BRIEF",
-    entityType: "shoot_request",
-    entityId: requestId,
-    clientId: shoot.clientId,
-    expiresAt,
-  });
-  const url = `${appOrigin()}/c/${token}`;
-  const result = await sendNotification(
-    db(),
-    {
-      template: "brief_approval",
-      recipient: shoot.clientPhone ?? shoot.clientName,
-      title: notifyTemplates.briefApproval.title,
-      body: notifyTemplates.briefApproval.body(shoot.clientName, shortDate(shoot.shootDate), url),
-      url,
-      redacted: {
-        body: notifyTemplates.briefApproval.body(
-          shoot.clientName,
-          shortDate(shoot.shootDate),
-          `[link:${tokenId}]`,
+  return db().transaction(async (tx) => {
+    await tx
+      .select({ id: shootRequests.id })
+      .from(shootRequests)
+      .where(eq(shootRequests.id, requestId))
+      .for("update");
+    // Duplicate-within-window is decided under the lock, BEFORE revoking.
+    if (opts.idempotencyKey) {
+      const [already] = await tx
+        .select({ status: notifications.status })
+        .from(notifications)
+        .where(eq(notifications.idempotencyKey, opts.idempotencyKey));
+      if (already && already.status !== "FAILED") return { status: "DUPLICATE" as const };
+    }
+    await tx
+      .update(accessTokens)
+      .set({ revokedAt: at })
+      .where(
+        and(
+          eq(accessTokens.purpose, "APPROVE_BRIEF"),
+          eq(accessTokens.entityId, requestId),
+          isNull(accessTokens.revokedAt),
+          isNull(accessTokens.usedAt),
         ),
-        url: `[link:${tokenId}]`,
-      },
+      );
+    const { token, id: tokenId } = await issueToken(tx, {
+      purpose: "APPROVE_BRIEF",
       entityType: "shoot_request",
       entityId: requestId,
-      idempotencyKey: opts.idempotencyKey ?? `brief:${requestId}:${tokenId}`,
-    },
-    { record: opts.record },
-  );
-  return { status: result.status };
+      clientId: shoot.clientId,
+      expiresAt,
+    });
+    const url = `${appOrigin()}/c/${token}`;
+    const result = await sendNotification(
+      tx,
+      {
+        template: "brief_approval",
+        recipient: shoot.clientPhone ?? shoot.clientName,
+        title: notifyTemplates.briefApproval.title,
+        body: notifyTemplates.briefApproval.body(shoot.clientName, shortDate(shoot.shootDate!), url),
+        url,
+        redacted: {
+          body: notifyTemplates.briefApproval.body(
+            shoot.clientName,
+            shortDate(shoot.shootDate!),
+            `[link:${tokenId}]`,
+          ),
+          url: `[link:${tokenId}]`,
+        },
+        entityType: "shoot_request",
+        entityId: requestId,
+        idempotencyKey: opts.idempotencyKey ?? `brief:${requestId}:${tokenId}`,
+      },
+      { record: opts.record },
+    );
+    return { status: result.status };
+  });
 }
 
 /** Console/sweep re-send: fresh link, windowed idempotency decided by the caller. */
@@ -316,22 +343,8 @@ export async function resendBriefApprovalLink(
   opts: { idempotencyKey?: string; record?: (tx: Tx) => Promise<void> } = {},
   at = new Date(),
 ): Promise<{ status: "SENT" | "DUPLICATE" | "FAILED" }> {
-  // Duplicate-within-window must be decided BEFORE revoking the live link.
-  if (opts.idempotencyKey) {
-    const dup = await hasLiveNotification(opts.idempotencyKey);
-    if (dup) return { status: "DUPLICATE" };
-  }
   const shoot = await confirmedShootContext(db(), requestId);
   return sendBriefApprovalLink(requestId, shoot, at, opts);
-}
-
-async function hasLiveNotification(idempotencyKey: string): Promise<boolean> {
-  const { notifications } = await import("@/db/schema");
-  const [row] = await db()
-    .select({ status: notifications.status })
-    .from(notifications)
-    .where(eq(notifications.idempotencyKey, idempotencyKey));
-  return Boolean(row && row.status !== "FAILED");
 }
 
 export interface BriefApprovalPage {
@@ -391,8 +404,10 @@ export type BriefChoiceResult =
 
 /**
  * The client approves: version locks (immutable by trigger), BRIEF_APPROVED,
- * and the approved brief is AUTO-SENT to the photographer — one transaction
- * for state, notification post-commit.
+ * one transaction. The hand-off to the photographer is a SEPARATE step: the
+ * spine deliberately parks on SYSTEM/SEND_BRIEF_TO_SUPPLIER (due now) until
+ * the link is actually delivered — a failed send is a VISIBLE stall the
+ * hourly sweep retries, never a silently-recorded "sent".
  */
 export async function approveBrief(rawToken: string, at = new Date()): Promise<BriefChoiceResult> {
   const verified = await verifyToken(db(), rawToken, "APPROVE_BRIEF", at, { oneShot: true });
@@ -427,71 +442,94 @@ export async function approveBrief(rawToken: string, at = new Date()): Promise<B
       at,
       actor: { type: "CLIENT", id: ctx.clientId },
     });
-
-    // Auto-send to the supplier — the same breath, the same transaction.
-    await applyTransition(tx, requestId, {
-      kind: "BRIEF_SENT_TO_SUPPLIER",
-      at,
-      actor: { type: "SYSTEM" },
-      supplierId: ctx.supplierId,
-      shootDate: ctx.shootDate,
-    });
-    await tx
-      .update(briefs)
-      .set({ status: "SENT_TO_SUPPLIER", sentToSupplierAt: at })
-      .where(eq(briefs.id, brief.id));
     await markTokenUsed(tx, verified.token.id, at);
     return ctx;
   });
   if (!shoot) return { ok: false, reason: "GONE" };
 
-  // Post-commit: the photographer's read-only link to the approved brief.
-  await sendBriefToSupplierLink(requestId, shoot);
+  // Post-commit: deliver, and only then record BRIEF_SENT_TO_SUPPLIER.
+  await deliverApprovedBriefToSupplier(requestId, at);
   return { ok: true, outcome: "APPROVED" };
 }
 
-async function sendBriefToSupplierLink(
+/**
+ * The auto-send itself: mint the photographer's read-only link, deliver it,
+ * and — only on success — fire BRIEF_SENT_TO_SUPPLIER, all under the request
+ * lock. Idempotent by the spine guard (a second run finds the hand-off done).
+ * Called right after approval and retried by the hourly brief sweep.
+ */
+export async function deliverApprovedBriefToSupplier(
   requestId: string,
-  shoot: Awaited<ReturnType<typeof confirmedShootContext>>,
-): Promise<void> {
-  if (!shoot.shootDate || !shoot.supplierId || !shoot.supplierName) return;
+  at = new Date(),
+): Promise<{ status: "SENT" | "FAILED" | "SKIPPED" }> {
   const rules = await loadRules(db());
   const tz = rules.string(RULE.timezone);
-  const expiresAt = addHours(
-    dateAtHourInTz(shoot.shootDate, rules.int(RULE.shootDayEndHour), tz),
-    7 * 24, // the brief link stays useful through delivery questions
-  );
-  const { token, id: tokenId } = await issueToken(db(), {
-    purpose: "VIEW_SHOOT",
-    entityType: "shoot_request",
-    entityId: requestId,
-    supplierId: shoot.supplierId,
-    expiresAt,
-  });
-  const url = `${appOrigin()}/s/${token}`;
-  await sendNotification(db(), {
-    template: "brief_to_supplier",
-    recipient: shoot.supplierPhone ?? shoot.supplierName,
-    title: notifyTemplates.briefToSupplier.title,
-    body: notifyTemplates.briefToSupplier.body(
-      shoot.supplierName,
-      shoot.clientName,
-      shortDate(shoot.shootDate),
-      url,
-    ),
-    url,
-    redacted: {
+  return db().transaction(async (tx) => {
+    const [req] = await tx
+      .select()
+      .from(shootRequests)
+      .where(eq(shootRequests.id, requestId))
+      .for("update");
+    if (!req || req.currentAction !== "SEND_BRIEF_TO_SUPPLIER") {
+      return { status: "SKIPPED" as const };
+    }
+    const shoot = await confirmedShootContext(tx, requestId);
+    if (!shoot.shootDate || !shoot.supplierId || !shoot.supplierName) {
+      return { status: "SKIPPED" as const };
+    }
+    const expiresAt = addHours(
+      dateAtHourInTz(shoot.shootDate, rules.int(RULE.shootDayEndHour), tz),
+      SUPPLIER_BRIEF_LINK_EXTRA_DAYS * 24, // stays useful through delivery questions
+    );
+    const { token, id: tokenId } = await issueToken(tx, {
+      purpose: "VIEW_SHOOT",
+      entityType: "shoot_request",
+      entityId: requestId,
+      supplierId: shoot.supplierId,
+      expiresAt,
+    });
+    const url = `${appOrigin()}/s/${token}`;
+    const result = await sendNotification(tx, {
+      template: "brief_to_supplier",
+      recipient: shoot.supplierPhone ?? shoot.supplierName,
+      title: notifyTemplates.briefToSupplier.title,
       body: notifyTemplates.briefToSupplier.body(
         shoot.supplierName,
         shoot.clientName,
         shortDate(shoot.shootDate),
-        `[link:${tokenId}]`,
+        url,
       ),
-      url: `[link:${tokenId}]`,
-    },
-    entityType: "shoot_request",
-    entityId: requestId,
-    idempotencyKey: `brief-supplier:${requestId}:${tokenId}`,
+      url,
+      redacted: {
+        body: notifyTemplates.briefToSupplier.body(
+          shoot.supplierName,
+          shoot.clientName,
+          shortDate(shoot.shootDate),
+          `[link:${tokenId}]`,
+        ),
+        url: `[link:${tokenId}]`,
+      },
+      entityType: "shoot_request",
+      entityId: requestId,
+      idempotencyKey: `brief-supplier:${requestId}:${tokenId}`,
+    });
+    if (result.status === "FAILED") {
+      // The stall stays visible (SYSTEM/SEND_BRIEF_TO_SUPPLIER, overdue) and
+      // the sweep will retry with a fresh link.
+      return { status: "FAILED" as const };
+    }
+    await applyTransition(tx, requestId, {
+      kind: "BRIEF_SENT_TO_SUPPLIER",
+      at,
+      actor: { type: "SYSTEM" },
+      supplierId: shoot.supplierId,
+      shootDate: shoot.shootDate,
+    });
+    await tx
+      .update(briefs)
+      .set({ status: "SENT_TO_SUPPLIER", sentToSupplierAt: at })
+      .where(eq(briefs.shootRequestId, requestId));
+    return { status: "SENT" as const };
   });
 }
 
@@ -609,7 +647,11 @@ export async function sweepLateBriefs(
     .where(
       and(
         inArray(shootRequests.status, ["CONFIRMED", "BRIEF_PENDING"]),
-        inArray(shootRequests.currentAction, ["WRITE_BRIEF", "APPROVE_BRIEF"]),
+        inArray(shootRequests.currentAction, [
+          "WRITE_BRIEF",
+          "APPROVE_BRIEF",
+          "SEND_BRIEF_TO_SUPPLIER",
+        ]),
         lt(shootRequests.actionDueAt, now),
       ),
     );
@@ -618,6 +660,13 @@ export async function sweepLateBriefs(
   const skipped: string[] = [];
   for (const req of overdue) {
     try {
+      if (req.action === "SEND_BRIEF_TO_SUPPLIER") {
+        // An approved brief whose hand-off failed/crashed: retry the delivery
+        // (fresh link; BRIEF_SENT_TO_SUPPLIER fires only on success).
+        const result = await deliverApprovedBriefToSupplier(req.id, now);
+        if (result.status === "SENT") reminded.push(req.id);
+        continue;
+      }
       if (req.action === "APPROVE_BRIEF") {
         // The client is late — a nudge without a working link is useless.
         const result = await resendBriefApprovalLink(
